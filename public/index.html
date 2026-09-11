@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#8b3d60">
+  <title>Minha Loja de Doces</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body class="public-page">
+  <header class="store-header">
+    <div class="container header-inner">
+      <a class="brand" href="/" aria-label="Página inicial">
+        <span class="brand-mark">D</span>
+        <span><strong id="store-name">Minha Loja</strong><small>doces feitos para compartilhar</small></span>
+      </a>
+      <button class="cart-button" id="open-cart" type="button" aria-label="Abrir carrinho">
+        Carrinho <span id="cart-count" class="count-badge">0</span>
+      </button>
+    </div>
+  </header>
+
+  <main>
+    <section class="hero container">
+      <div>
+        <span class="eyebrow">CATÁLOGO ONLINE</span>
+        <h1>Seu momento doce começa aqui.</h1>
+        <p>Escolha seus favoritos, confira a disponibilidade e envie seu pedido com poucos toques. Para encomendas, mostramos o prazo de produção antes da confirmação.</p>
+      </div>
+      <div class="hero-card"><span>feito com carinho</span><strong>Doces que chegam<br>na hora certa.</strong></div>
+    </section>
+
+    <section class="container campaign-section" id="campaign-section" hidden><div class="section-heading"><div><span class="eyebrow">LOTE ATUAL</span><h2 id="campaign-title">Campanha</h2></div></div><div id="campaign-card" class="panel"></div></section>
+
+  <section class="container catalog-section">
+      <div class="section-heading"><div><span class="eyebrow">NOSSOS PRODUTOS</span><h2>Escolha seus favoritos</h2></div><span id="catalog-status" class="muted">Carregando catálogo…</span></div>
+      <div id="product-grid" class="product-grid" aria-live="polite"></div>
+    </section>
+  </main>
+
+  <div class="drawer-backdrop" id="drawer-backdrop"></div>
+  <aside class="cart-drawer" id="cart-drawer" aria-label="Carrinho" aria-hidden="true">
+    <div class="drawer-header"><div><span class="eyebrow">SEU PEDIDO</span><h2>Carrinho</h2></div><button class="icon-button" id="close-cart" type="button" aria-label="Fechar">×</button></div>
+    <div id="cart-items" class="cart-items"></div>
+    <div id="cart-empty" class="empty-state"><strong>Seu carrinho está vazio.</strong><span>Adicione um doce para começar.</span></div>
+    <div class="cart-footer">
+      <div class="total-row"><span>Subtotal</span><strong id="cart-total">R$ 0,00</strong></div>
+      <button id="checkout-button" class="primary-button full" type="button" disabled>Continuar pedido</button>
+    </div>
+  </aside>
+
+  <div class="modal-backdrop" id="checkout-backdrop"></div>
+  <section class="modal" id="checkout-modal" role="dialog" aria-modal="true" aria-labelledby="checkout-title" aria-hidden="true">
+    <div class="modal-header"><div><span class="eyebrow">FINALIZAÇÃO</span><h2 id="checkout-title">Dados para entrega</h2></div><button class="icon-button" id="close-checkout" type="button" aria-label="Fechar">×</button></div>
+    <form id="checkout-form" class="form-grid">
+      <label>Nome completo<input name="name" required autocomplete="name"></label>
+      <label>WhatsApp / telefone<input name="phone" required autocomplete="tel" placeholder="(00) 00000-0000"></label>
+      <label>E-mail <span class="optional">opcional</span><input name="email" type="email" autocomplete="email"></label>
+      <label>CEP<input name="postalCode" autocomplete="postal-code"></label>
+      <label class="span-2">Endereço completo<input name="address" required autocomplete="street-address" placeholder="Rua, número, complemento e bairro"></label>
+      <label>Cidade<input name="city" required autocomplete="address-level2"></label>
+      <label>Estado<input name="state" required maxlength="2" autocomplete="address-level1"></label>
+      <label>Forma de pagamento<select name="paymentMethod"><option value="pix">Pix</option><option value="cartao">Cartão</option><option value="boleto">Boleto</option><option value="a_combinar">A combinar</option></select></label>
+      <label>Observações <span class="optional">opcional</span><textarea name="notes" rows="3" placeholder="Algum detalhe para o pedido?"></textarea></label>
+      <p id="checkout-error" class="form-error span-2" role="alert"></p>
+      <div class="summary-box span-2"><span>Total do pedido</span><strong id="checkout-total">R$ 0,00</strong></div>
+      <button class="primary-button full span-2" type="submit">Enviar pedido</button>
+    </form>
+  </section>
+
+  <div class="toast" id="toast" role="status"></div>
+  <script src="/store.js"></script>
+</body>
+</html>

@@ -1,0 +1,2 @@
+6.4.0
+Consolidação: V6.3 + painel WhatsApp restaurado + identidade LID/telefone + cadastro obrigatório e aprovação de clientes + permissão específica + auditoria.
