@@ -12,7 +12,7 @@ const wa=fs.readFileSync(require('path').join(root,'whatsapp-service.js'),'utf8'
 const admin=fs.readFileSync(require('path').join(root,'public/admin.js'),'utf8');
 const html=fs.readFileSync(require('path').join(root,'public/admin.html'),'utf8');
 const pkg=require(require('path').join(root,'package.json'));
-ok('version 0.6.4',pkg.version==='0.6.4');
+ok('version 0.6.5.1',pkg.version==='0.6.5.1');
 ok('customer table',server.includes('CREATE TABLE IF NOT EXISTS customers'));
 ok('persistent registration sessions',server.includes('customer_registration_sessions'));
 ok('approval permission',server.includes('can_approve_customers') && html.includes('canApproveCustomers'));
