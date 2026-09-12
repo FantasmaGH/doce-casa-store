@@ -1,6 +1,6 @@
-# Doce Casa Store — V6.3 Operação Completa
+# Doce Casa Store — V6.5 Operação Profissional
 
-Esta versão fecha o fluxo operacional da loja: cliente, vendedor, pagamento, produção, separação, entrega, atendimento, financeiro e auditoria.
+Esta versão fecha o fluxo operacional da loja: cliente, vendedor, pagamento, produção, separação, entrega, atendimento, financeiro, auditoria, rastreamento, alteração controlada e recuperação operacional.
 
 ## Regras principais
 
@@ -16,7 +16,10 @@ Esta versão fecha o fluxo operacional da loja: cliente, vendedor, pagamento, pr
 - Grupos do WhatsApp são ignorados pelo robô.
 - Permissões são verificadas no backend, não somente no menu.
 - O WhatsApp do administrador não recebe comandos administrativos por ser administrador; ele segue as permissões cadastradas para aquele número.
-- O cliente recebe notificações simples de status, incluindo `🚚 Saiu para entrega`, sem expor dados desnecessários do entregador.
+- O cliente recebe notificações de status, pagamento, vencimento, alteração, separação, saída para entrega e conclusão, sem expor dados desnecessários do entregador.
+- O cliente acompanha o pedido pelo código e telefone no WhatsApp; a resposta inclui status atual, histórico, pagamento e próxima etapa.
+- Lembretes de pagamento verificam o status antes do envio e não são enviados para pedidos já pagos.
+- O atendimento permanece no número oficial da Doce Casa; funcionários assumem tickets internamente e nunca recebem o cliente em número pessoal.
 - A equipe recebe notificações operacionais pela fila interna do WhatsApp.
 - Toda ação operacional importante pode ser registrada em `audit_logs`.
 
@@ -72,12 +75,11 @@ Financeiro, quando permitido:
 
 Recebe somente:
 
-1. Comprar
-2. Produtos
-3. Campanhas
-4. Status
-5. Alterar pedido
-6. Atendente
+1. Produtos
+2. Campanhas
+3. Status
+4. Alterar pedido
+5. Atendente
 
 ## Venda vinculada ao vendedor
 
@@ -100,9 +102,9 @@ Fluxo recomendado:
 
 ## Atendimento
 
-O cliente envia `6` e o servidor abre um ticket. Todos os funcionários com permissão **Atendimento** recebem uma notificação. O primeiro autorizado a executar `atender ATD-00001` assume o chamado. O ticket fica associado ao cliente e ao pedido quando houver pedido.
+O cliente envia `5` e o servidor abre um ticket. Todos os funcionários com permissão **Atendimento** recebem uma notificação. O primeiro autorizado a executar `atender ATD-00001` assume o chamado. O ticket fica associado ao cliente e ao pedido quando houver pedido.
 
-O painel administrativo possui fila de atendimentos e histórico de auditoria.
+As mensagens são persistidas em `support_messages`. O atendente usa `responder ATD-00001 texto`; a resposta sai novamente pelo número oficial da Doce Casa. O painel administrativo possui fila, mensagens e histórico de auditoria.
 
 ## Auditoria
 
@@ -158,6 +160,12 @@ Também foram acrescentadas/ajustadas rotinas administrativas de edição para e
 - Despesas arquivadas em vez de apagadas.
 - Rate limit básico no login e segredos obrigatórios.
 - Notificações de campanha incluem o link de acesso quando disponível.
+
+## V6.5 — operação profissional
+
+A V6.5 adiciona histórico de pedidos normais, solicitações controladas de alteração, pagamentos com vencimento, lembretes idempotentes, mensagens persistentes de atendimento, dados completos para entregadores, notificações idempotentes e migração compatível com bancos existentes. A branch de desenvolvimento deve ser testada em ambiente isolado antes da promoção para produção.
+
+Critérios obrigatórios antes da implantação: testes de regressão, backup, restauração, HTTPS, PM2/systemd isolado, reconexão do WhatsApp e homologação do fluxo cliente → pedido → pagamento → separação → entrega.
 
 ## V6.3 — auditoria e produção
 

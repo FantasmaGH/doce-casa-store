@@ -87,8 +87,8 @@ function attachClientEvents(instance) {
 
       if (['oi', 'olá', 'ola', 'menu', 'ajuda', 'start', '/start', '/menu', 'help', 'comandos'].includes(body)) return message.reply(menuText());
       if (['comprar', 'link', 'catalogo', 'catálogo', '1'].includes(body)) return sendCatalogLink(message, phone, null);
-      if (['produtos', 'produto', '2'].includes(body)) return sendCatalogLink(message, phone, null);
-      if (['campanhas', 'campanha', 'lotes', 'lote', '3'].includes(body)) {
+      if (['produtos', 'produto', '1'].includes(body)) return sendCatalogLink(message, phone, null);
+      if (['campanhas', 'campanha', 'lotes', 'lote', '2'].includes(body)) {
         const { campaigns } = await storeInternal('/api/internal/campaigns');
         if (!campaigns.length) return message.reply('📅 Não há campanhas/lotes publicados no momento.');
         const lines = [];
@@ -102,23 +102,32 @@ function attachClientEvents(instance) {
         }
         return message.reply(`📅 Campanhas disponíveis:\n\n${lines.join('\n\n')}`);
       }
-      if (body === '4' || body === 'status' || body === 'pedido') return message.reply('📦 Envie o código do pedido. Exemplo: PED-20260907-ABC123');
+      if (body === '3' || body === 'status' || body === 'pedido') return message.reply('📦 Envie o código do pedido. Exemplo: status PED-20260907-ABC123');
       const orderMatch = body.match(/(?:pedido|status)\s+([a-z0-9-]+)/i);
       if (orderMatch) return replyOrderStatus(message, phone, orderMatch[1]);
       if (/^ped-[a-z0-9-]+$/i.test(body)) return replyOrderStatus(message, phone, body);
-      if (body === '5' || body.includes('alterar pedido') || body.includes('acrescentar') || body.includes('editar pedido')) return message.reply('✏️ Para solicitar uma alteração, envie o número do pedido e explique o que deseja alterar. A equipe verificará se ainda é possível ajustar.');
-      if (body === '6' || body === 'atendente') {
+      const changeMatch = body.match(/^alterar\s+(ped-[a-z0-9-]+)\s+(cod-[a-z0-9-]+)\s+([\s\S]+)$/i);
+      if (changeMatch) {
+        const data = await storeInternal(`/api/public/orders/${encodeURIComponent(changeMatch[1])}/change-requests`, { method:'POST', body:JSON.stringify({ number:changeMatch[1], code:changeMatch[2], phone, notes:changeMatch[3], reason:changeMatch[3] }) });
+        return message.reply(`✏️ Solicitação registrada para ${changeMatch[1].toUpperCase()}.\n\nA equipe vai verificar se ainda é possível alterar o pedido e informará qualquer diferença de valor.`);
+      }
+      if (body === '4' || body.includes('alterar pedido') || body.includes('acrescentar') || body.includes('editar pedido')) return message.reply('✏️ Envie: alterar PED-XXXXXX COD-XXXXXX explique o que deseja alterar. A equipe verificará o estágio, estoque e eventual diferença de valor.');
+      if (body === '5' || body === 'atendente') {
         const data = await storeInternal('/api/internal/support/request', { method: 'POST', body: JSON.stringify({ phone, name: message._data?.notifyName || '' }) });
         if (!data.attendants?.length) return message.reply('👤 Recebi sua solicitação, mas nossa equipe de atendimento está offline no momento. Tente novamente em instantes.');
         return message.reply(`👤 Solicitação aberta!\n\nChamamos nossa equipe de atendimento.\nProtocolo: ATD-${String(data.ticket.id).padStart(5,'0')}\n\nAssim que alguém assumir, continuaremos por aqui.`);
       }
       const open = await storeInternal(`/api/internal/support/by-phone?phone=${encodeURIComponent(phone)}`).catch(() => null);
       if (open?.ticket?.assigned_staff_id) {
+        await storeInternal(`/api/internal/support/${open.ticket.id}/message`, { method:'POST', body:JSON.stringify({ direction:'inbound', senderType:'customer', senderName:message._data?.notifyName || '', body:original, deliveryStatus:'received' }) }).catch(() => null);
         await message.reply('💬 Sua mensagem foi encaminhada para o atendente.');
         const target = await storeInternal(`/api/internal/support/${open.ticket.id}/message-target`);
         return sendWhatsAppMessage(target.staffPhone || open.ticket.staff_phone, `💬 Cliente ${open.ticket.customer_name || phone} (ATD-${String(open.ticket.id).padStart(5,'0')}):\n${original}`);
       }
-      if (open?.ticket) return message.reply('💬 Seu atendimento está na fila. Assim que um atendente assumir, continuaremos por aqui.');
+      if (open?.ticket) {
+        await storeInternal(`/api/internal/support/${open.ticket.id}/message`, { method:'POST', body:JSON.stringify({ direction:'inbound', senderType:'customer', senderName:message._data?.notifyName || '', body:original, deliveryStatus:'received' }) }).catch(() => null);
+        return message.reply('💬 Sua mensagem foi registrada no atendimento. Assim que um atendente assumir, continuaremos por aqui.');
+      }
     } catch (error) {
       console.error('[whatsapp] falha ao responder:', error.message);
       await message.reply('Não consegui consultar agora. Tente novamente em instantes ou digite ajuda.').catch(() => {});
@@ -479,7 +488,7 @@ function staffMenu(staff) {
   lines.push('', 'Digite ajuda a qualquer momento.');
   return lines.join('\n');
 }
-function menuText() { return 'Olá! 👋 Escolha uma opção:\n\n1. Comprar — receber link do catálogo\n2. Produtos — receber link do catálogo\n3. Campanhas — ver próximos lotes\n4. Status — consultar pedido\n5. Alterar pedido — solicitar ajuste\n6. Atendente — falar com a equipe\n\nDigite o número da opção ou escreva o comando desejado.'; }
+function menuText() { return 'Olá! 👋 Escolha uma opção:\n\n1. Produtos — receber link do catálogo\n2. Campanhas — ver próximos lotes\n3. Status — acompanhar pedido\n4. Alterar pedido — solicitar ajuste\n5. Atendente — falar com a equipe\n\nDigite o número da opção ou escreva o comando desejado.'; }
 async function sendStaffCatalogLink(message, phone, staff) {
   const data = await storeInternal('/api/internal/catalog-links', { method: 'POST', body: JSON.stringify({ phone, staffId: staff?.id || null }) });
   const minutes = Math.max(1, Math.round((new Date(data.expiresAt).getTime() - Date.now()) / 60000));
@@ -584,7 +593,7 @@ async function handleStaffMessage(message, staff, original, body, phone) {
   const close = body.match(/^finalizar\s+atd-(\d+)$/i);
   if (close) { await storeInternal(`/api/internal/support/${Number(close[1])}/close`, { method:'POST', body:JSON.stringify({phone}) }); return message.reply('✅ Atendimento finalizado.'); }
   const reply = body.match(/^responder\s+atd-(\d+)\s+([\s\S]+)/i);
-  if (reply) { const target=await storeInternal(`/api/internal/support/${Number(reply[1])}/message-target`, { method:'POST', body:JSON.stringify({phone}) }); await sendWhatsAppMessage(target.phone, reply[2]); return message.reply('↩️ Resposta enviada ao cliente.'); }
+  if (reply) { const ticketId=Number(reply[1]); const target=await storeInternal(`/api/internal/support/${ticketId}/message-target`, { method:'POST', body:JSON.stringify({phone}) }); await sendWhatsAppMessage(target.phone, reply[2]); await storeInternal(`/api/internal/support/${ticketId}/message`, { method:'POST', body:JSON.stringify({ direction:'outbound', senderType:'staff', senderName:staff.name, senderId:staff.id, body:reply[2], deliveryStatus:'sent' }) }); return message.reply('↩️ Resposta enviada ao cliente pelo número oficial da Doce Casa.'); }
   const open = await storeInternal(`/api/internal/support/by-phone?phone=${encodeURIComponent(phone)}`).catch(() => null);
   if (open?.ticket?.assigned_staff_id === staff.id) return message.reply('💬 Use: responder ATD-00001 sua mensagem');
   return message.reply(staffMenu(staff));
@@ -608,10 +617,14 @@ function formatNotification(item) {
   if (item.type==='campaign_order_created') return `🍫 Pedido de campanha recebido!\n\nCampanha: ${p.campaignName || 'Campanha'}\n📦 Pedido: ${p.orderNumber}\n🔐 Código de acesso: ${p.accessCode}\n💰 Total: R$ ${(Number(p.totalCents||0)/100).toFixed(2).replace('.',',')}\n\n📲 Para acompanhar ou alterar seu pedido, abra o link abaixo e vá em “Consultar meu pedido”. Informe o número do pedido, seu WhatsApp e o código de acesso.\n${p.campaignUrl ? `\n🔗 ${p.campaignUrl}\n` : ''}\nGuarde esse código: ele também será usado para alterações permitidas no pedido.`;
   if (item.type==='new_sale') return `🛒 Nova venda!\nPedido: ${p.orderNumber}\nCliente: ${p.customerName}\nTotal: R$ ${Number(p.total||0).toFixed(2).replace('.',',')}`;
   if (item.type==='new_picking') return `📦 Novo pedido para separação\n${p.orderNumber}\nCliente: ${p.customerName}\n\nUse: separar ${p.orderNumber}`;
-  if (item.type==='new_delivery') return `🚚 Nova entrega disponível\n${p.orderNumber}\nCliente: ${p.customerName}\n\nUse: entregar ${p.orderNumber}`;
+  if (item.type==='new_delivery') return `🚚 NOVA ENTREGA DISPONÍVEL\n\nPedido: ${p.orderNumber}\nCliente: ${p.customerName || 'não informado'}\nTelefone: ${p.customerPhone || 'não informado'}\n\nEndereço:\n${p.address || 'não informado'}${p.city ? `\n${p.city}/${p.state || ''} ${p.postalCode || ''}` : ''}\n\nObservação: ${p.shippingNotes || 'nenhuma'}\nValor: R$ ${Number(p.total || 0).toFixed(2).replace('.', ',')}\nPagamento: ${p.paymentStatus || 'a confirmar'}\n\nUse: entregar ${p.orderNumber}`;
   if (item.type==='new_support') return `💬 NOVO ATENDIMENTO\nATD-${String(p.ticketId).padStart(5,'0')}\nCliente: ${p.customerName || 'não informado'}\nTelefone: ${p.customerPhone}\n${p.orderNumber ? `Pedido: ${p.orderNumber}\n` : ''}\nUse: atender ATD-${String(p.ticketId).padStart(5,'0')}`;
   if (item.type==='order_status') return `📦 ${p.orderNumber}\n🚚 ${p.label || p.status}`;
-  if (item.type==='payment_paid') return `💰 Pagamento confirmado\nPedido: ${p.orderNumber}`;
+  if (item.type==='payment_paid') return `💰 Pagamento confirmado\nPedido: ${p.orderNumber}\nValor: R$ ${Number(p.total || 0).toFixed(2).replace('.', ',')}`;
+  if (item.type==='payment_due') return `💰 PAGAMENTO PENDENTE\nPedido: ${p.orderNumber}\nValor: R$ ${Number(p.total || 0).toFixed(2).replace('.', ',')}${p.dueDate ? `\nVencimento: ${formatDate(p.dueDate)}` : ''}\n\nSe você já pagou, desconsidere esta mensagem e aguarde a confirmação da equipe.`;
+  if (item.type==='order_change_received') return `✏️ Solicitação de alteração recebida\nPedido: ${p.orderNumber}\n\nNossa equipe vai verificar estoque, etapa e eventual diferença de valor.`;
+  if (item.type==='order_change_approved') return `✅ Alteração aprovada\nPedido: ${p.orderNumber}\nNovo total: R$ ${Number(p.total || 0).toFixed(2).replace('.', ',')}`;
+  if (item.type==='order_change_rejected') return `❌ Alteração não aprovada\nPedido: ${p.orderNumber}\n\nEntre em contato pelo menu Atendente para saber o motivo.`;
   if (item.type==='campaign_order_updated') return `✏️ Pedido de campanha atualizado\nPedido: ${p.orderNumber}\n💰 Total: R$ ${(Number(p.totalCents||0)/100).toFixed(2).replace('.',',')}\nPago: R$ ${(Number(p.paidCents||0)/100).toFixed(2).replace('.',',')}\nA pagar: R$ ${(Number(p.remainingCents||0)/100).toFixed(2).replace('.',',')}`;
   if (item.type==='campaign_payment_paid') return `💰 Pagamento da campanha confirmado\nPedido: ${p.orderNumber}`;
   if (item.type==='campaign_refund_pending') return `💸 Ajuste financeiro necessário\nPedido: ${p.orderNumber}\nValor a estornar: R$ ${(Number(p.refundPendingCents||0)/100).toFixed(2).replace('.',',')}\n\nNossa equipe entrará em contato para concluir o ajuste.`;
@@ -893,19 +906,22 @@ async function sendWhatsAppMessage(phone, text) {
 function senderPhone(message) { return String(message.from || '').split('@')[0].replace(/\D/g, ''); }
 function formatDate(value) { if (!value) return 'a combinar'; const [y, m, d] = String(value).slice(0, 10).split('-'); return `${d}/${m}/${y}`; }
 function menuText() {
-  return 'Olá! 👋 Escolha uma opção:\n\n1. Comprar — receber link do catálogo\n2. Produtos — receber link do catálogo\n3. Campanhas — ver próximos lotes\n4. Status — consultar pedido\n5. Alterar pedido — solicitar ajuste\n6. Atendente — falar com a equipe\n\nDigite o número da opção ou escreva o comando desejado.';
+  return 'Olá! 👋 Escolha uma opção:\n\n1. Produtos — receber link do catálogo\n2. Campanhas — ver próximos lotes\n3. Status — acompanhar pedido\n4. Alterar pedido — solicitar ajuste\n5. Atendente — falar com a equipe\n\nDigite o número da opção ou escreva o comando desejado.';
 }
 
 async function sendCatalogLink(message, phone) {
   const data = await storeInternal('/api/internal/catalog-links', { method: 'POST', body: JSON.stringify({ phone }) });
   const minutes = Math.max(1, Math.round((new Date(data.expiresAt).getTime() - Date.now()) / 60000));
-  return message.reply(`🛒 Seu catálogo está pronto!\n\n${data.url}\n\n👆 Toque no endereço acima para abrir.\n🔒 Link exclusivo e de uso único.\n⏱️ Válido por aproximadamente ${minutes} minutos.\n⚠️ Não encaminhe o link.`);
+  await message.reply(`🛒 Seu catálogo está pronto!\n\nPara abrir:\n1. Toque e segure o endereço da próxima mensagem.\n2. Escolha Copiar.\n3. Abra o Chrome ou outro navegador.\n4. Toque na barra de endereço.\n5. Cole o endereço completo, desde https:// até o último caractere.\n6. Toque em Ir/Enter.\n\n🔒 O link é exclusivo e de uso único.\n⏱️ Válido por aproximadamente ${minutes} minutos.\n⚠️ Não encaminhe nem compartilhe o link.`);
+  return message.reply(data.url);
 }
 
 async function replyOrderStatus(message, phone, code) {
   const { order } = await storeInternal(`/api/internal/order-status?number=${encodeURIComponent(code)}&phone=${encodeURIComponent(phone)}`);
   const status = { pending: 'Pedido recebido', confirmed: 'Pedido confirmado', preparing: 'Em preparo', shipped: '🚚 Saiu para entrega', delivered: '✅ Entregue', cancelled: 'Pedido cancelado' }[order.status] || order.status;
-  return message.reply(`📦 ${order.orderNumber}\n${status}`);
+  const payment = order.paymentStatus === 'paid' ? '✅ Pagamento confirmado' : `💰 Pagamento: ${order.paymentStatus || 'pendente'}${order.paymentDueDate ? ` até ${formatDate(order.paymentDueDate)}` : ''}`;
+  const history = (order.timeline || []).slice(-8).map(item => `• ${item.action} — ${formatDate(item.createdAt)}`).join('\n');
+  return message.reply(`📦 *${order.orderNumber}*\n\nStatus atual: *${status}*\n${payment}\n💰 Total: R$ ${Number(order.total || 0).toFixed(2).replace('.', ',')}\n\n📋 Histórico:\n${history || 'Pedido recebido'}\n\nPróxima etapa: ${order.nextStep || 'aguarde nova atualização'}`);
 }
 
 async function storeInternal(route, options = {}) {

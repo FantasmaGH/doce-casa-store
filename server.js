@@ -232,6 +232,67 @@ db.exec(`
     FOREIGN KEY(order_id) REFERENCES orders(id) ON DELETE SET NULL,
     FOREIGN KEY(assigned_staff_id) REFERENCES staff_users(id) ON DELETE SET NULL
   );
+  CREATE TABLE IF NOT EXISTS order_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    order_id INTEGER NOT NULL,
+    action TEXT NOT NULL,
+    before_json TEXT NOT NULL DEFAULT '{}',
+    after_json TEXT NOT NULL DEFAULT '{}',
+    actor_type TEXT NOT NULL DEFAULT 'system',
+    actor_id INTEGER,
+    actor_name TEXT NOT NULL DEFAULT '',
+    reason TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY(order_id) REFERENCES orders(id) ON DELETE CASCADE
+  );
+  CREATE TABLE IF NOT EXISTS order_change_requests (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    order_id INTEGER NOT NULL,
+    access_code TEXT NOT NULL,
+    customer_phone TEXT NOT NULL,
+    requested_json TEXT NOT NULL DEFAULT '{}',
+    recalculated_json TEXT NOT NULL DEFAULT '{}',
+    status TEXT NOT NULL DEFAULT 'pending',
+    reason TEXT NOT NULL DEFAULT '',
+    reviewed_by INTEGER,
+    reviewed_at TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY(order_id) REFERENCES orders(id) ON DELETE CASCADE,
+    FOREIGN KEY(reviewed_by) REFERENCES staff_users(id) ON DELETE SET NULL
+  );
+  CREATE TABLE IF NOT EXISTS order_payments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    order_id INTEGER NOT NULL,
+    amount_cents INTEGER NOT NULL,
+    method TEXT NOT NULL DEFAULT 'a_combinar',
+    status TEXT NOT NULL DEFAULT 'pending',
+    due_date TEXT,
+    paid_at TEXT,
+    failed_at TEXT,
+    refunded_at TEXT,
+    reference TEXT NOT NULL DEFAULT '',
+    notes TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY(order_id) REFERENCES orders(id) ON DELETE CASCADE
+  );
+  CREATE TABLE IF NOT EXISTS support_messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ticket_id INTEGER NOT NULL,
+    direction TEXT NOT NULL,
+    sender_type TEXT NOT NULL,
+    sender_id INTEGER,
+    sender_name TEXT NOT NULL DEFAULT '',
+    message_type TEXT NOT NULL DEFAULT 'text',
+    body TEXT NOT NULL,
+    delivery_status TEXT NOT NULL DEFAULT 'received',
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY(ticket_id) REFERENCES support_tickets(id) ON DELETE CASCADE
+  );
+  CREATE INDEX IF NOT EXISTS idx_order_history_order ON order_history(order_id, id);
+  CREATE INDEX IF NOT EXISTS idx_order_changes_order ON order_change_requests(order_id, id);
+  CREATE INDEX IF NOT EXISTS idx_order_payments_order ON order_payments(order_id, id);
+  CREATE INDEX IF NOT EXISTS idx_support_messages_ticket ON support_messages(ticket_id, id);
 `);
 
 function ensureColumn(table, column, definition) {
@@ -250,6 +311,9 @@ ensureColumn('orders', 'picker_id', 'INTEGER');
 ensureColumn('orders', 'driver_id', 'INTEGER');
 ensureColumn('orders', 'approved_by', 'INTEGER');
 ensureColumn('orders', 'approved_at', 'TEXT');
+ensureColumn('orders', 'payment_due_date', 'TEXT');
+ensureColumn('orders', 'payment_paid_at', 'TEXT');
+ensureColumn('orders', 'payment_reminder_sent_at', 'TEXT');
 ensureColumn('products', 'vendor_price_cents', 'INTEGER NOT NULL DEFAULT 0');
 ensureColumn('order_items', 'unit_vendor_price_cents', 'INTEGER NOT NULL DEFAULT 0');
 ensureColumn('public_links', 'requested_by_staff_id', 'INTEGER');
@@ -351,6 +415,14 @@ ensureColumn('campaign_orders', 'production_started_at', 'TEXT');
 ensureColumn('campaign_orders', 'refund_pending_cents', 'INTEGER NOT NULL DEFAULT 0');
 ensureColumn('expenses', 'active', 'INTEGER NOT NULL DEFAULT 1');
 ensureColumn('purchases', 'stock_applied_qty', 'REAL NOT NULL DEFAULT 0');
+ensureColumn('notifications', 'idempotency_key', 'TEXT');
+db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_notifications_idempotency ON notifications(idempotency_key) WHERE idempotency_key IS NOT NULL");
+db.exec(`INSERT INTO order_payments (order_id, amount_cents, method, status, due_date)
+  SELECT o.id, o.total_cents, o.payment_method, o.payment_status, o.payment_due_date
+  FROM orders o WHERE NOT EXISTS (SELECT 1 FROM order_payments p WHERE p.order_id=o.id);
+INSERT INTO order_history (order_id, action, after_json, actor_type, actor_name)
+  SELECT o.id, 'legacy_import', json_object('status', o.status, 'paymentStatus', o.payment_status, 'totalCents', o.total_cents), 'system', 'migração V6.5'
+  FROM orders o WHERE NOT EXISTS (SELECT 1 FROM order_history h WHERE h.order_id=o.id);`);
 
 function seedAdmin() {
   const email = String(process.env.ADMIN_EMAIL || '').trim().toLowerCase();
@@ -410,13 +482,14 @@ function priceTiersForProduct(productId, includeCost = true) {
   }));
 }
 
-function normalizePriceTiers(input, fallbackCost) {
+function normalizePriceTiers(input, fallbackCostCents) {
   if (!Array.isArray(input)) return [];
+  const fallback = Math.max(0, Number(fallbackCostCents) || 0);
   const tiers = input.map(row => ({
     minQty: Number(String(row.minQty ?? '').replace(',', '.')),
     maxQty: row.maxQty === null || row.maxQty === '' || row.maxQty === undefined ? null : Number(String(row.maxQty).replace(',', '.')),
-    priceCents: Math.max(0, cents(row.priceCents ?? row.price)),
-    costCents: Math.max(0, cents(row.costCents ?? row.cost ?? fallbackCost))
+    priceCents: Math.max(0, row.priceCents !== undefined ? Number(row.priceCents) || 0 : cents(row.price)),
+    costCents: Math.max(0, row.costCents !== undefined ? Number(row.costCents) || 0 : (row.cost !== undefined ? cents(row.cost) : fallback))
   })).filter(row => Number.isFinite(row.minQty) && row.minQty > 0 && (row.maxQty === null || (Number.isFinite(row.maxQty) && row.maxQty >= row.minQty)));
   tiers.sort((a, b) => a.minQty - b.minQty);
   for (let index = 1; index < tiers.length; index += 1) {
@@ -498,10 +571,19 @@ function orderView(order) {
   }));
   return {
     ...order,
+    orderNumber: order.order_number,
+    customerName: order.customer_name,
+    customerPhone: order.customer_phone,
+    paymentStatus: order.payment_status,
+    status: order.status,
     subtotal: money(order.subtotal_cents),
     shipping: money(order.shipping_cents),
     total: money(order.total_cents),
+    paymentDueDate: order.payment_due_date || null,
+    paymentPaidAt: order.payment_paid_at || null,
     inventoryCommitted: Boolean(order.inventory_committed),
+    history: orderTimeline(order.id),
+    payments: paymentTimeline(order.id),
     items
   };
 }
@@ -544,10 +626,19 @@ function staffByPhone(phone) { return db.prepare('SELECT * FROM staff_users WHER
 function logAudit(actorType, actorId, actorName, action, entityType, entityId, details = {}) {
   db.prepare('INSERT INTO audit_logs (actor_type, actor_id, actor_name, action, entity_type, entity_id, details_json) VALUES (?, ?, ?, ?, ?, ?, ?)').run(actorType, actorId || null, actorName || '', action, entityType, entityId || null, JSON.stringify(details));
 }
-function queueNotification(phone, type, payload = {}) {
+function queueNotification(phone, type, payload = {}, idempotencyKey = null) {
   const normalized = normalizePhone(phone);
   if (normalized.length < 8) return;
-  db.prepare('INSERT INTO notifications (phone, type, payload_json) VALUES (?, ?, ?)').run(normalized, type, JSON.stringify(payload));
+  const payloadJson = JSON.stringify(payload);
+  const key = idempotencyKey || crypto.createHash('sha256').update(`${normalized}|${type}|${payloadJson}`).digest('hex');
+  db.prepare('INSERT OR IGNORE INTO notifications (phone, type, payload_json, idempotency_key) VALUES (?, ?, ?, ?)').run(normalized, type, payloadJson, key);
+}
+function recordOrderHistory(orderId, action, before = {}, after = {}, actor = {}, reason = '') {
+  db.prepare('INSERT INTO order_history (order_id, action, before_json, after_json, actor_type, actor_id, actor_name, reason) VALUES (?, ?, ?, ?, ?, ?, ?, ?)').run(Number(orderId), action, JSON.stringify(before || {}), JSON.stringify(after || {}), actor.type || 'system', actor.id || null, actor.name || '', reason || '');
+}
+function recordSupportMessage(ticketId, direction, senderType, senderId, senderName, body, messageType = 'text', deliveryStatus = 'received') {
+  if (!String(body || '').trim()) return;
+  db.prepare('INSERT INTO support_messages (ticket_id, direction, sender_type, sender_id, sender_name, message_type, body, delivery_status) VALUES (?, ?, ?, ?, ?, ?, ?, ?)').run(Number(ticketId), direction, senderType, senderId || null, senderName || '', messageType, String(body), deliveryStatus);
 }
 function queueStaffNotification(permission, type, payload = {}) {
   const column = permission === 'attend' ? 'can_attend' : permission === 'pick' ? 'can_pick' : permission === 'deliver' ? 'can_deliver' : permission === 'sell' ? 'can_sell' : permission === 'approve_customers' ? 'can_approve_customers' : null;
@@ -1014,6 +1105,7 @@ app.patch('/api/internal/staff/orders/:id/status', requireWhatsAppInternal, (req
     if (staff.can_pick && ['waiting','separating','blocked'].includes(current.picking_status)) {
       if (current.picker_id && current.picker_id !== staff.id) return res.status(409).json({ error: 'A separação já foi assumida por outro funcionário.' });
       db.prepare("UPDATE orders SET picking_status='separating', picker_id=?, updated_at=CURRENT_TIMESTAMP WHERE id=?").run(staff.id,id);
+      recordOrderHistory(id, 'picking_claimed', { pickingStatus: current.picking_status }, { pickingStatus: 'separating' }, { type:'staff', id:staff.id, name:staff.name });
       logAudit('staff', staff.id, staff.name, 'picking_claimed', 'order', id, {});
     } else if (staff.can_deliver && ['queued','route','failed'].includes(current.delivery_status)) {
       if (current.driver_id && current.driver_id !== staff.id) return res.status(409).json({ error: 'A entrega já foi assumida por outro funcionário.' });
@@ -1027,49 +1119,116 @@ app.patch('/api/internal/staff/orders/:id/status', requireWhatsAppInternal, (req
     if (!staff.can_pick) return res.status(403).json({ error: 'Este usuário não pode separar pedidos.' });
     if (current.picker_id && current.picker_id !== staff.id) return res.status(409).json({ error: 'A separação já foi assumida por outro funcionário.' });
     db.prepare("UPDATE orders SET picking_status='separating', picker_id=?, updated_at=CURRENT_TIMESTAMP WHERE id=?").run(staff.id,id);
+    recordOrderHistory(id, 'picking_started', { pickingStatus: current.picking_status }, { pickingStatus: 'separating' }, { type:'staff', id:staff.id, name:staff.name });
     logAudit('staff', staff.id, staff.name, 'picking_started', 'order', id, {});
   } else if (action === 'separado') {
     if (!staff.can_pick) return res.status(403).json({ error: 'Este usuário não pode separar pedidos.' });
     if (current.picker_id && current.picker_id !== staff.id) return res.status(409).json({ error: 'A separação pertence a outro funcionário.' });
     db.prepare("UPDATE orders SET picking_status='separated', picker_id=?, updated_at=CURRENT_TIMESTAMP WHERE id=?").run(staff.id,id);
-    queueStaffNotification('deliver','new_delivery',{orderNumber:current.order_number, customerName:current.customer_name});
+    queueStaffNotification('deliver','new_delivery',{orderNumber:current.order_number, customerName:current.customer_name, customerPhone:current.customer_phone, address:current.shipping_address, city:current.shipping_city, state:current.shipping_state, postalCode:current.shipping_postal_code, shippingNotes:current.shipping_notes, total:money(current.total_cents), paymentStatus:current.payment_status});
+    recordOrderHistory(id, 'picking_completed', { pickingStatus: current.picking_status }, { pickingStatus: 'separated' }, { type:'staff', id:staff.id, name:staff.name });
+    queueNotification(current.customer_phone, 'order_status', { orderNumber:current.order_number, status:'separated', label:'pedido separado' }, `order:${id}:picking:separated`);
     logAudit('staff', staff.id, staff.name, 'picking_completed', 'order', id, {});
   } else if (action === 'entregar') {
     if (!staff.can_deliver) return res.status(403).json({ error: 'Este usuário não pode atualizar entregas.' });
     if (current.driver_id && current.driver_id !== staff.id) return res.status(409).json({ error: 'A entrega pertence a outro funcionário.' });
     db.prepare("UPDATE orders SET delivery_status='route', driver_id=?, assigned_driver=?, status=CASE WHEN status='confirmed' THEN 'shipped' ELSE status END, updated_at=CURRENT_TIMESTAMP WHERE id=?").run(staff.id,staff.name,id);
-    queueNotification(current.customer_phone,'order_status',{orderNumber:current.order_number,status:'shipped',label:'saiu para entrega'});
+    queueNotification(current.customer_phone,'order_status',{orderNumber:current.order_number,status:'shipped',label:'saiu para entrega'}, `order:${id}:delivery:shipped`);
+    recordOrderHistory(id, 'delivery_started', { deliveryStatus: current.delivery_status }, { deliveryStatus: 'route', status: 'shipped' }, { type:'staff', id:staff.id, name:staff.name });
     logAudit('staff', staff.id, staff.name, 'delivery_started', 'order', id, {});
   } else if (action === 'entregue') {
     if (!staff.can_deliver) return res.status(403).json({ error: 'Este usuário não pode atualizar entregas.' });
     if (current.driver_id && current.driver_id !== staff.id) return res.status(409).json({ error: 'A entrega pertence a outro funcionário.' });
     db.prepare("UPDATE orders SET delivery_status='delivered', driver_id=?, assigned_driver=?, delivered_at=COALESCE(delivered_at,CURRENT_TIMESTAMP), status='delivered', updated_at=CURRENT_TIMESTAMP WHERE id=?").run(staff.id,staff.name,id);
-    queueNotification(current.customer_phone,'order_status',{orderNumber:current.order_number,status:'delivered',label:'entregue'});
+    queueNotification(current.customer_phone,'order_status',{orderNumber:current.order_number,status:'delivered',label:'entregue'}, `order:${id}:delivery:delivered`);
+    recordOrderHistory(id, 'delivery_completed', { deliveryStatus: current.delivery_status, status: current.status }, { deliveryStatus: 'delivered', status: 'delivered' }, { type:'staff', id:staff.id, name:staff.name });
     logAudit('staff', staff.id, staff.name, 'delivery_completed', 'order', id, {});
   } else return res.status(400).json({ error: 'Ação inválida.' });
   res.json({ ok: true, order: orderView(db.prepare('SELECT * FROM orders WHERE id=?').get(id)) });
 });
 
+function findOrderByAccess(orderNumber, accessCode, phone) {
+  const normalizedPhone = normalizePhone(phone);
+  if (normalizedPhone.length < 8) return null;
+  if (accessCode) return db.prepare("SELECT o.* FROM orders o JOIN order_access_codes c ON c.order_id=o.id WHERE c.code=? AND replace(replace(replace(replace(o.customer_phone,' ',''),'-',''),'(',''),')','')=?").get(String(accessCode).toUpperCase(), normalizedPhone);
+  if (orderNumber) return db.prepare("SELECT * FROM orders WHERE order_number=? AND replace(replace(replace(replace(customer_phone,' ',''),'-',''),'(',''),')','')=?").get(String(orderNumber).toUpperCase(), normalizedPhone);
+  return null;
+}
+function orderTimeline(orderId) {
+  return db.prepare('SELECT id, action, before_json AS beforeJson, after_json AS afterJson, actor_type AS actorType, actor_name AS actorName, reason, created_at AS createdAt FROM order_history WHERE order_id=? ORDER BY id ASC').all(orderId).map(row => ({ ...row, before: JSON.parse(row.beforeJson || '{}'), after: JSON.parse(row.afterJson || '{}') }));
+}
+function paymentTimeline(orderId) {
+  return db.prepare('SELECT id, amount_cents AS amountCents, method, status, due_date AS dueDate, paid_at AS paidAt, failed_at AS failedAt, refunded_at AS refundedAt, reference, notes, created_at AS createdAt FROM order_payments WHERE order_id=? ORDER BY id ASC').all(orderId).map(row => ({ ...row, amount: money(row.amountCents) }));
+}
+function publicOrderView(order) {
+  const view = orderView(order);
+  return { orderNumber: order.order_number, accessCode: db.prepare('SELECT code FROM order_access_codes WHERE order_id=?').get(order.id)?.code, customerName: order.customer_name, status: order.status, pickingStatus: order.picking_status, deliveryStatus: order.delivery_status, paymentStatus: order.payment_status, paymentDueDate: order.payment_due_date || null, paymentPaidAt: order.payment_paid_at || null, total: money(order.total_cents), createdAt: order.created_at, updatedAt: order.updated_at, nextStep: order.status === 'pending' ? 'Aguardando confirmação' : order.status === 'confirmed' ? 'Aguardando separação' : order.status === 'preparing' ? 'Separação em andamento' : order.status === 'shipped' ? 'Em entrega' : order.status === 'delivered' ? 'Pedido concluído' : order.status === 'cancelled' ? 'Pedido cancelado' : order.status, items: view.items.map(item => ({ name: item.name, quantity: item.quantity })), timeline: orderTimeline(order.id), payments: paymentTimeline(order.id) };
+}
 app.get('/api/public/order-status', (req, res) => {
-  const accessCode = String(req.query.code || '').trim().toUpperCase();
-  const orderNumber = String(req.query.number || '').trim().toUpperCase();
-  const phone = String(req.query.phone || '').replace(/\D/g, '');
-  let order = null;
-  if (accessCode && phone.length >= 8) order = db.prepare("SELECT o.* FROM orders o JOIN order_access_codes c ON c.order_id = o.id WHERE c.code = ? AND replace(replace(replace(replace(o.customer_phone, ' ', ''), '-', ''), '(', ''), ')', '') = ?").get(accessCode, phone);
-  else if (orderNumber && phone.length >= 8) order = db.prepare('SELECT * FROM orders WHERE order_number = ? AND replace(replace(replace(replace(customer_phone, \' \', \'\'), \'-\', \'\'), \'(\', \'\'), \')\', \'\') = ?').get(orderNumber, phone);
+  const order = findOrderByAccess(req.query.number, req.query.code, req.query.phone);
   if (!order) return res.status(404).json({ error: 'Pedido não encontrado com esse código.' });
-  res.json({ order: { orderNumber: order.order_number, accessCode: db.prepare('SELECT code FROM order_access_codes WHERE order_id = ?').get(order.id)?.code, status: order.status, pickingStatus: order.picking_status, deliveryStatus: order.delivery_status, paymentStatus: order.payment_status, total: money(order.total_cents), createdAt: order.created_at, items: orderView(order).items.map(item => ({ name: item.name, quantity: item.quantity })) } });
+  res.json({ order: publicOrderView(order) });
 });
-
-app.get('/api/internal/order-status', requireWhatsAppInternal, (req, res) => {
-  const accessCode = String(req.query.code || '').trim().toUpperCase();
-  const orderNumber = String(req.query.number || '').trim().toUpperCase();
-  const phone = normalizePhone(req.query.phone);
-  let order = null;
-  if (accessCode && phone.length >= 8) order = db.prepare("SELECT o.* FROM orders o JOIN order_access_codes c ON c.order_id = o.id WHERE c.code = ? AND replace(replace(replace(replace(o.customer_phone, ' ', ''), '-', ''), '(', ''), ')', '') = ?").get(accessCode, phone);
-  else if (orderNumber && phone.length >= 8) order = db.prepare("SELECT * FROM orders WHERE order_number = ? AND replace(replace(replace(replace(customer_phone, ' ', ''), '-', ''), '(', ''), ')', '') = ?").get(orderNumber, phone);
+app.post('/api/public/orders/:number/change-requests', (req, res) => {
+  const body = req.body || {};
+  const order = findOrderByAccess(req.params.number, body.code, body.phone);
   if (!order) return res.status(404).json({ error: 'Pedido não encontrado com esse código.' });
-  res.json({ order: { orderNumber: order.order_number, accessCode: db.prepare('SELECT code FROM order_access_codes WHERE order_id = ?').get(order.id)?.code, status: order.status, pickingStatus: order.picking_status, deliveryStatus: order.delivery_status, paymentStatus: order.payment_status, total: money(order.total_cents), createdAt: order.created_at, items: orderView(order).items.map(item => ({ name: item.name, quantity: item.quantity })) } });
+  if (order.status === 'cancelled' || order.status === 'delivered' || order.inventory_committed || !['waiting','separating'].includes(order.picking_status)) return res.status(409).json({ error: 'Este pedido não pode mais ser alterado nesta etapa.' });
+  const requestedItems = Array.isArray(body.items) ? body.items.map(item => ({ productId: Number(item.productId), quantity: Number(item.quantity) })).filter(item => Number.isInteger(item.productId) && Number.isFinite(item.quantity) && item.quantity > 0) : null;
+  if (requestedItems && !requestedItems.length) return res.status(400).json({ error: 'Informe pelo menos um item válido.' });
+  const requested = { items: requestedItems, shipping: body.shipping || null, notes: body.notes === undefined ? null : String(body.notes) };
+  const request = db.prepare('INSERT INTO order_change_requests (order_id, access_code, customer_phone, requested_json, reason) VALUES (?, ?, ?, ?, ?)').run(order.id, String(body.code || '').toUpperCase(), normalizePhone(body.phone), JSON.stringify(requested), String(body.reason || 'Solicitação do cliente'));
+  recordOrderHistory(order.id, 'change_requested', { status: order.status }, { requestId: request.lastInsertRowid, requested }, { type: 'customer', name: order.customer_name });
+  queueStaffNotification('pick', 'order_change_requested', { orderNumber: order.order_number, customerName: order.customer_name, requestId: request.lastInsertRowid });
+  queueNotification(order.customer_phone, 'order_change_received', { orderNumber: order.order_number });
+  res.status(201).json({ requestId: request.lastInsertRowid, status: 'pending', message: 'Solicitação recebida e encaminhada para análise.' });
+});
+app.get('/api/admin/order-change-requests', requireAdmin, (_req, res) => {
+  const rows = db.prepare(`SELECT r.*, o.order_number, o.customer_name, o.customer_phone, o.status AS order_status FROM order_change_requests r JOIN orders o ON o.id=r.order_id WHERE r.status='pending' ORDER BY r.id ASC LIMIT 200`).all().map(row => ({ ...row, requested: JSON.parse(row.requested_json || '{}'), recalculated: JSON.parse(row.recalculated_json || '{}') }));
+  res.json({ requests: rows });
+});
+app.patch('/api/admin/order-change-requests/:id', requireAdmin, (req, res) => {
+  const request = db.prepare('SELECT r.*, o.* FROM order_change_requests r JOIN orders o ON o.id=r.order_id WHERE r.id=? AND r.status=\'pending\'').get(Number(req.params.id));
+  if (!request) return res.status(404).json({ error: 'Solicitação não encontrada.' });
+  const decision = String(req.body?.decision || '').toLowerCase();
+  if (!['approved','rejected'].includes(decision)) return res.status(400).json({ error: 'Decisão inválida.' });
+  const requested = JSON.parse(request.requested_json || '{}');
+  if (decision === 'rejected') {
+    db.prepare("UPDATE order_change_requests SET status='rejected', reviewed_by=?, reviewed_at=CURRENT_TIMESTAMP, reason=? WHERE id=?").run(req.admin?.sub || null, String(req.body.reason || 'Alteração rejeitada'), request.id);
+    recordOrderHistory(request.order_id, 'change_rejected', { requestId: request.id }, { requestId: request.id, status: 'rejected' }, { type: 'admin', id: req.admin?.sub, name: req.admin?.email }, String(req.body.reason || ''));
+    queueNotification(request.customer_phone, 'order_change_rejected', { orderNumber: request.order_number });
+    return res.json({ ok: true, status: 'rejected' });
+  }
+  const requestedItems = Array.isArray(requested.items) && requested.items.length
+    ? requested.items
+    : db.prepare('SELECT product_id AS productId, quantity FROM order_items WHERE order_id=?').all(request.order_id);
+  if (!requestedItems.length) return res.status(400).json({ error: 'O pedido não possui itens para recalcular.' });
+  const normalized = [];
+  for (const item of requestedItems) {
+    const product = db.prepare('SELECT * FROM products WHERE id=? AND active=1').get(item.productId);
+    if (!product) return res.status(409).json({ error: 'Produto indisponível na alteração.' });
+    if (product.availability === 'ready' && Number(product.stock_qty) < item.quantity) return res.status(409).json({ error: `Estoque insuficiente para ${product.name}.` });
+    normalized.push({ product, quantity: item.quantity, pricing: priceForQuantity(product, item.quantity) });
+  }
+  const subtotal = normalized.reduce((sum, item) => sum + Math.round(item.quantity * item.pricing.priceCents), 0);
+  const shipping = requested.shipping || {};
+  const shippingCents = requested.shipping ? Math.max(0, cents(requested.shipping.shippingCents || 0)) : request.shipping_cents;
+  const total = subtotal + shippingCents;
+  db.transaction(() => {
+    db.prepare('DELETE FROM order_items WHERE order_id=?').run(request.order_id);
+    const insert = db.prepare('INSERT INTO order_items (order_id, product_id, name_snapshot, quantity, unit_price_cents, unit_vendor_price_cents, unit_cost_cents) VALUES (?, ?, ?, ?, ?, ?, ?)');
+    normalized.forEach(item => insert.run(request.order_id, item.product.id, item.product.name, item.quantity, item.pricing.priceCents, item.product.vendor_price_cents, item.pricing.costCents));
+    db.prepare("UPDATE orders SET subtotal_cents=?, shipping_cents=?, total_cents=?, shipping_address=COALESCE(?, shipping_address), shipping_city=COALESCE(?, shipping_city), shipping_state=COALESCE(?, shipping_state), shipping_postal_code=COALESCE(?, shipping_postal_code), shipping_notes=COALESCE(?, shipping_notes), notes=COALESCE(?, notes), updated_at=CURRENT_TIMESTAMP WHERE id=?").run(subtotal, shippingCents, total, shipping.address || null, shipping.city || null, shipping.state || null, shipping.postalCode || null, shipping.notes || null, requested.notes, request.order_id);
+    db.prepare("UPDATE order_change_requests SET status='approved', recalculated_json=?, reviewed_by=?, reviewed_at=CURRENT_TIMESTAMP WHERE id=?").run(JSON.stringify({ subtotalCents: subtotal, shippingCents, totalCents: total }), req.admin?.sub || null, request.id);
+  })();
+  recordOrderHistory(request.order_id, 'change_approved', { totalCents: request.total_cents }, { totalCents: total, requestId: request.id }, { type: 'admin', id: req.admin?.sub, name: req.admin?.email });
+  queueNotification(request.customer_phone, 'order_change_approved', { orderNumber: request.order_number, total: money(total) });
+  res.json({ ok: true, status: 'approved', order: orderView(db.prepare('SELECT * FROM orders WHERE id=?').get(request.order_id)) });
+});
+app.get('/api/internal/order-status', requireWhatsAppInternal, (req, res) => {
+  const order = findOrderByAccess(req.query.number, req.query.code, req.query.phone);
+  if (!order) return res.status(404).json({ error: 'Pedido não encontrado com esse código.' });
+  res.json({ order: publicOrderView(order) });
 });
 
 app.post('/api/public/orders', requireCatalogAccess, (req, res) => {
@@ -1098,7 +1257,10 @@ app.post('/api/public/orders', requireCatalogAccess, (req, res) => {
 
   const pricedItems = normalizedItems.map(item => ({ ...item, pricing: priceForQuantity(item.product, item.quantity) }));
   const subtotalCents = pricedItems.reduce((sum, item) => sum + Math.round(item.quantity * item.pricing.priceCents), 0);
-  const shippingCents = Math.max(0, cents(body.shippingCents || 0));
+  const shippingInput = body.shippingCents ?? 0;
+  const shippingCents = typeof shippingInput === 'number' && Number.isInteger(shippingInput)
+    ? Math.max(0, shippingInput)
+    : Math.max(0, cents(shippingInput));
   const totalCents = subtotalCents + shippingCents;
   const salespersonId = orderSellerFromCatalogAccess(req);
   const today = new Date().toISOString().slice(0, 10);
@@ -1154,6 +1316,8 @@ app.post('/api/public/orders', requireCatalogAccess, (req, res) => {
   });
 
   const order = db.prepare('SELECT * FROM orders WHERE id = ?').get(createOrder());
+  recordOrderHistory(order.id, 'created', {}, { status: order.status, paymentStatus: order.payment_status, totalCents: order.total_cents }, { type: 'system', name: salespersonId ? (db.prepare('SELECT name FROM staff_users WHERE id = ?').get(salespersonId)?.name || '') : '' });
+  db.prepare('INSERT OR IGNORE INTO order_payments (order_id, amount_cents, method, status, due_date) VALUES (?, ?, ?, ?, ?)').run(order.id, order.total_cents, order.payment_method, order.payment_status, order.payment_due_date || null);
   logAudit('system', null, salespersonId ? (db.prepare('SELECT name FROM staff_users WHERE id = ?').get(salespersonId)?.name || '') : '', 'order_created', 'order', order.id, { source: order.source, salespersonId });
   queueNotification(order.customer_phone, 'order_created', { orderNumber: order.order_number, total: money(order.total_cents) });
   if (salespersonId) queueNotification(db.prepare('SELECT phone FROM staff_users WHERE id = ?').get(salespersonId)?.phone, 'new_sale', { orderNumber: order.order_number, customerName: order.customer_name, total: money(order.total_cents) });
@@ -1403,6 +1567,8 @@ app.patch('/api/admin/orders/:id', requireAdmin, (req, res) => {
   const allowedPayment = ['pending', 'paid', 'refunded', 'failed'];
   const nextStatus = allowedStatus.includes(req.body.status) ? req.body.status : current.status;
   const nextPayment = allowedPayment.includes(req.body.paymentStatus) ? req.body.paymentStatus : current.payment_status;
+  const requestedDueDate = req.body.paymentDueDate === undefined ? current.payment_due_date : String(req.body.paymentDueDate || '').trim();
+  if (requestedDueDate && !/^\d{4}-\d{2}-\d{2}$/.test(requestedDueDate)) return res.status(400).json({ error: 'Data de vencimento inválida.' });
   try {
     if (nextStatus === 'cancelled' && ['shipped','delivered'].includes(current.status)) return res.status(409).json({ error: 'Pedidos em entrega ou já entregues não podem ser cancelados. Use um fluxo de devolução/estorno.' });
     if (nextStatus === 'cancelled' && current.payment_status === 'paid' && nextPayment !== 'refunded') return res.status(409).json({ error: 'Pedido pago: registre o estorno antes de cancelar.' });
@@ -1413,21 +1579,50 @@ app.patch('/api/admin/orders/:id', requireAdmin, (req, res) => {
         for(const item of items){db.prepare('UPDATE products SET stock_qty=stock_qty+?,updated_at=CURRENT_TIMESTAMP WHERE id=?').run(item.quantity,item.product_id);db.prepare("INSERT INTO stock_movements(product_id,type,quantity,unit_cost_cents,note) VALUES(?, 'in', ?, ?, ?)").run(item.product_id,item.quantity,item.unit_cost_cents,`Estorno do pedido ${current.order_number}`);}
         db.prepare('UPDATE orders SET inventory_committed=0 WHERE id=?').run(id);
       }
-      db.prepare('UPDATE orders SET status = ?, payment_status = ?, notes = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?').run(nextStatus, nextPayment, req.body.notes === undefined ? current.notes : String(req.body.notes), id);
+      db.prepare('UPDATE orders SET status = ?, payment_status = ?, payment_due_date = ?, notes = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?').run(nextStatus, nextPayment, requestedDueDate || null, req.body.notes === undefined ? current.notes : String(req.body.notes), id);
     })();
   } catch (error) {
     return res.status(409).json({ error: error.message });
   }
   const row = db.prepare('SELECT * FROM orders WHERE id = ?').get(id);
+  recordOrderHistory(id, 'status_changed', { status: current.status, paymentStatus: current.payment_status }, { status: nextStatus, paymentStatus: nextPayment }, { type: 'admin', id: req.admin?.sub, name: req.admin?.email }, String(req.body.reason || ''));
+  if (nextPayment !== current.payment_status || requestedDueDate !== current.payment_due_date) {
+    db.prepare(`UPDATE orders SET payment_paid_at = ${nextPayment === 'paid' ? 'COALESCE(payment_paid_at,CURRENT_TIMESTAMP)' : 'NULL'}, payment_reminder_sent_at = NULL WHERE id = ?`).run(id);
+    db.prepare('INSERT OR IGNORE INTO order_payments (order_id, amount_cents, method, status, due_date) VALUES (?, ?, ?, ?, ?)').run(id, row.total_cents, row.payment_method, nextPayment, requestedDueDate || null);
+    db.prepare('UPDATE order_payments SET status = ?, due_date = ?, paid_at = CASE WHEN ? = \'paid\' THEN COALESCE(paid_at,CURRENT_TIMESTAMP) ELSE paid_at END, updated_at = CURRENT_TIMESTAMP WHERE order_id = ? AND status NOT IN (\'refunded\')').run(nextPayment, requestedDueDate || null, nextPayment, id);
+  }
   logAudit('admin', req.admin?.sub, req.admin?.email, 'order_status_changed', 'order', id, { status: nextStatus, paymentStatus: nextPayment });
   const statusMessages = { confirmed: 'confirmado', preparing: 'em preparo', shipped: 'saiu para entrega', delivered: 'entregue', cancelled: 'cancelado' };
   if (statusMessages[nextStatus]) queueNotification(row.customer_phone, 'order_status', { orderNumber: row.order_number, status: nextStatus, label: statusMessages[nextStatus] });
-  if (nextPayment === 'paid') queueNotification(row.customer_phone, 'payment_paid', { orderNumber: row.order_number });
+  if (nextPayment === 'paid' && current.payment_status !== 'paid') queueNotification(row.customer_phone, 'payment_paid', { orderNumber: row.order_number, total: money(row.total_cents) }, `order:${id}:payment:paid`);
   if (nextStatus === 'confirmed' && current.status !== 'confirmed') queueStaffNotification('pick', 'new_picking', { orderNumber: row.order_number, customerName: row.customer_name });
   if (nextStatus === 'preparing') queueStaffNotification('pick', 'order_preparing', { orderNumber: row.order_number });
   res.json({ order: orderView(row) });
 });
 
+app.get('/api/admin/orders/:id/history', requireAdmin, (req, res) => {
+  const order = db.prepare('SELECT id FROM orders WHERE id=?').get(Number(req.params.id));
+  if (!order) return res.status(404).json({ error: 'Pedido não encontrado.' });
+  res.json({ history: orderTimeline(order.id), payments: paymentTimeline(order.id) });
+});
+app.post('/api/admin/orders/:id/payment', requireAdmin, (req, res) => {
+  const id = Number(req.params.id);
+  const order = db.prepare('SELECT * FROM orders WHERE id=?').get(id);
+  if (!order) return res.status(404).json({ error: 'Pedido não encontrado.' });
+  const status = ['pending','paid','failed','refunded'].includes(req.body?.status) ? req.body.status : order.payment_status;
+  const dueDate = req.body?.dueDate === undefined ? order.payment_due_date : String(req.body.dueDate || '').trim();
+  if (dueDate && !/^\d{4}-\d{2}-\d{2}$/.test(dueDate)) return res.status(400).json({ error: 'Data de vencimento inválida.' });
+  const before = { status: order.payment_status, dueDate: order.payment_due_date, paidAt: order.payment_paid_at };
+  db.transaction(() => {
+    db.prepare('UPDATE orders SET payment_status=?, payment_due_date=?, payment_paid_at=CASE WHEN ?=\'paid\' THEN COALESCE(payment_paid_at,CURRENT_TIMESTAMP) ELSE payment_paid_at END, payment_reminder_sent_at=NULL, updated_at=CURRENT_TIMESTAMP WHERE id=?').run(status, dueDate || null, status, id);
+    db.prepare('INSERT OR IGNORE INTO order_payments (order_id, amount_cents, method, status, due_date) VALUES (?, ?, ?, ?, ?)').run(id, order.total_cents, order.payment_method, status, dueDate || null);
+    db.prepare('UPDATE order_payments SET status=?, due_date=?, paid_at=CASE WHEN ?=\'paid\' THEN COALESCE(paid_at,CURRENT_TIMESTAMP) ELSE paid_at END, updated_at=CURRENT_TIMESTAMP WHERE order_id=? AND status NOT IN (\'refunded\')').run(status, dueDate || null, status, id);
+  })();
+  recordOrderHistory(id, 'payment_updated', before, { status, dueDate }, { type:'admin', id:req.admin?.sub, name:req.admin?.email }, String(req.body?.notes || ''));
+  if (status === 'paid' && order.payment_status !== 'paid') queueNotification(order.customer_phone, 'payment_paid', { orderNumber: order.order_number, total: money(order.total_cents) }, `order:${id}:payment:paid`);
+  if (status !== 'paid') queueNotification(order.customer_phone, 'payment_due', { orderNumber: order.order_number, total: money(order.total_cents), dueDate: dueDate || null }, `order:${id}:payment:${status}:${dueDate || 'none'}`);
+  res.json({ order: orderView(db.prepare('SELECT * FROM orders WHERE id=?').get(id)) });
+});
 app.get('/api/admin/expenses', requireAdmin, (_req, res) => {
   const rows = db.prepare('SELECT * FROM expenses WHERE active = 1 ORDER BY expense_date DESC, id DESC LIMIT 500').all();
   res.json({ expenses: rows.map(row => ({ ...row, amount: money(row.amount_cents) })) });
@@ -1829,6 +2024,22 @@ app.post('/api/internal/support/request', requireWhatsAppInternal, (req, res) =>
   const attendants = db.prepare('SELECT id, name, phone FROM staff_users WHERE active = 1 AND can_attend = 1').all();
   res.status(201).json({ ticket: { id: ticket.id, status: ticket.status, assignedStaffId: ticket.assigned_staff_id }, attendants });
 });
+app.post('/api/internal/support/:id/message', requireWhatsAppInternal, (req, res) => {
+  const id = Number(req.params.id);
+  const ticket = db.prepare('SELECT * FROM support_tickets WHERE id=?').get(id);
+  if (!ticket) return res.status(404).json({ error: 'Atendimento não encontrado.' });
+  const body = String(req.body?.body || '').trim();
+  if (!body) return res.status(400).json({ error: 'Mensagem vazia.' });
+  const direction = ['inbound','outbound'].includes(req.body?.direction) ? req.body.direction : 'inbound';
+  const senderType = String(req.body?.senderType || (direction === 'inbound' ? 'customer' : 'staff'));
+  const row = db.prepare('INSERT INTO support_messages (ticket_id, direction, sender_type, sender_id, sender_name, message_type, body, delivery_status) VALUES (?, ?, ?, ?, ?, ?, ?, ?)').run(id, direction, senderType, req.body?.senderId || null, String(req.body?.senderName || ''), String(req.body?.messageType || 'text'), body, String(req.body?.deliveryStatus || (direction === 'outbound' ? 'sent' : 'received')));
+  db.prepare('UPDATE support_tickets SET updated_at=CURRENT_TIMESTAMP WHERE id=?').run(id);
+  res.status(201).json({ message: db.prepare('SELECT * FROM support_messages WHERE id=?').get(row.lastInsertRowid) });
+});
+app.get('/api/internal/support/:id/messages', requireWhatsAppInternal, (req, res) => {
+  const rows = db.prepare('SELECT * FROM support_messages WHERE ticket_id=? ORDER BY id ASC LIMIT 500').all(Number(req.params.id));
+  res.json({ messages: rows });
+});
 app.get('/api/internal/support/queue', requireWhatsAppInternal, (_req, res) => {
   const tickets = db.prepare("SELECT t.*, s.name AS staff_name FROM support_tickets t LEFT JOIN staff_users s ON s.id=t.assigned_staff_id WHERE t.status='open' ORDER BY t.created_at ASC LIMIT 100").all();
   res.json({ tickets });
@@ -1868,7 +2079,7 @@ app.post('/api/internal/support/:id/message-target', requireWhatsAppInternal, (r
   res.json({ phone: ticket.customer_phone, staffPhone: ticket.staff_phone });
 });
 app.get('/api/admin/support', requireAdmin, (_req, res) => {
-  const tickets = db.prepare("SELECT t.*, s.name AS staff_name, o.order_number AS order_number FROM support_tickets t LEFT JOIN staff_users s ON s.id=t.assigned_staff_id LEFT JOIN orders o ON o.id=t.order_id ORDER BY CASE t.status WHEN 'open' THEN 0 WHEN 'assigned' THEN 1 ELSE 2 END, t.id DESC LIMIT 300").all();
+  const tickets = db.prepare("SELECT t.*, s.name AS staff_name, o.order_number AS order_number FROM support_tickets t LEFT JOIN staff_users s ON s.id=t.assigned_staff_id LEFT JOIN orders o ON o.id=t.order_id ORDER BY CASE t.status WHEN 'open' THEN 0 WHEN 'assigned' THEN 1 ELSE 2 END, t.id DESC LIMIT 300").all().map(ticket => ({ ...ticket, messages: db.prepare('SELECT * FROM support_messages WHERE ticket_id=? ORDER BY id ASC LIMIT 500').all(ticket.id) }));
   res.json({ tickets });
 });
 app.get('/api/admin/audit', requireAdmin, (_req, res) => {
@@ -1902,6 +2113,23 @@ app.use((error, _req, res, _next) => {
   if (error instanceof multer.MulterError) return res.status(400).json({ error: `Falha no upload: ${error.message}` });
   res.status(400).json({ error: error.message || 'Erro interno.' });
 });
+
+function queuePaymentReminders() {
+  if (String(process.env.PAYMENT_REMINDER_ENABLED || 'true').toLowerCase() !== 'true') return;
+  const today = new Date();
+  const tomorrow = new Date(today.getTime() + 24 * 60 * 60 * 1000);
+  const dueLimit = tomorrow.toISOString().slice(0, 10);
+  const rows = db.prepare("SELECT * FROM orders WHERE payment_status='pending' AND payment_due_date IS NOT NULL AND payment_due_date <= ? AND status NOT IN ('cancelled','delivered')").all(dueLimit);
+  for (const order of rows) {
+    const reminderKey = `order:${order.id}:payment-reminder:${dueLimit}`;
+    const before = db.prepare('SELECT id FROM notifications WHERE idempotency_key=?').get(reminderKey);
+    if (before) continue;
+    queueNotification(order.customer_phone, 'payment_due', { orderNumber: order.order_number, total: money(order.total_cents), dueDate: order.payment_due_date }, reminderKey);
+    db.prepare('UPDATE orders SET payment_reminder_sent_at=CURRENT_TIMESTAMP WHERE id=?').run(order.id);
+  }
+}
+queuePaymentReminders();
+setInterval(queuePaymentReminders, 15 * 60 * 1000).unref();
 
 app.listen(PORT, HOST, () => {
   console.log(`Loja de doces disponível em http://${HOST}:${PORT}`);
