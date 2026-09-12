@@ -1,6 +1,6 @@
 {
   "name": "doce-casa-store",
-  "version": "0.6.5",
+  "version": "0.6.5.1",
   "private": true,
   "description": "Catálogo, pedidos e operação completa com vendedores, separação, entregas, atendimento, financeiro e auditoria.",
   "main": "server.js",

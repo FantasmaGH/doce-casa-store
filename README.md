@@ -172,3 +172,20 @@ Critérios obrigatórios antes da implantação: testes de regressão, backup, r
 Esta versão consolida as correções de campanha, estoque, financeiro, edição, entrega, segurança e notificações. A campanha permanece independente do catálogo normal. O banco e o histórico devem ser preservados durante a implantação.
 
 Antes de produção, execute `npm run audit` e os testes de homologação descritos em `TESTES.md`.
+
+
+## V6.5.1 — fechamento financeiro e operacional
+
+A revisão V6.5.1 preserva os pagamentos originais e registra alterações de pedido em `order_payment_adjustments`. Quando uma alteração aprovada aumenta o total de um pedido já pago, o pedido passa a `partial` e é criada uma diferença pendente com vencimento e notificação. Quando uma alteração reduz um pedido já pago, é criado um ajuste de estorno pendente; o histórico original não é sobrescrito.
+
+Falhas e estornos passam a registrar `failed_at` e `refunded_at`. O administrador pode liquidar um ajuste por `PATCH /api/admin/orders/:id/payment-adjustments/:adjustmentId`, usando `paid` para diferenças e `refunded` para estornos. O cliente recebe mensagens pelo número oficial da loja e consegue consultar `paymentAdjustments` no rastreamento.
+
+Eventos operacionais podem ser registrados pelo administrador em `POST /api/admin/orders/:id/operational-event` com `ready`, `delayed`, `picking_issue`, `delivery_nearby` ou `delivery_incident`. Cada evento gera histórico, auditoria, notificação idempotente e mensagem específica no WhatsApp.
+
+A aplicação também envia headers de segurança padrão, incluindo proteção contra MIME sniffing, clickjacking, política de referência, permissões de navegador e Content Security Policy. Requisições administrativas que usam cookie são rejeitadas quando a origem ou o referer não correspondem ao host atual. HTTPS reverso continua obrigatório em produção.
+
+A suíte local `node scripts/test-v65.js` cobre schema, autenticação, custo das faixas, link único, pedido, timeline, pagamento, alteração, diferença financeira, liquidação de ajuste, eventos operacionais e proteção de origem. WhatsApp real, QR, reconexão, reboot, backup/restauração e Nginx/HTTPS continuam exigindo homologação no ambiente controlado do servidor antes do deploy.
+
+## Política de implantação
+
+A `main` permanece como rollback. A branch V6.5 deve ser instalada somente após backup verificável do SQLite, uploads e sessão WhatsApp; validação do `.env`; confirmação de permissões do usuário `doceapp`; teste de health check; validação dos dois processos PM2; e registro do commit exato instalado. Não apagar `data/whatsapp-auth` para tentar corrigir uma falha sem preservar primeiro uma cópia da sessão.

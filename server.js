@@ -276,6 +276,23 @@ db.exec(`
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY(order_id) REFERENCES orders(id) ON DELETE CASCADE
   );
+  CREATE TABLE IF NOT EXISTS order_payment_adjustments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    order_id INTEGER NOT NULL,
+    change_request_id INTEGER,
+    kind TEXT NOT NULL,
+    amount_cents INTEGER NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    reason TEXT NOT NULL DEFAULT '',
+    due_date TEXT,
+    paid_at TEXT,
+    refunded_at TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY(order_id) REFERENCES orders(id) ON DELETE CASCADE,
+    FOREIGN KEY(change_request_id) REFERENCES order_change_requests(id) ON DELETE SET NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_payment_adjustments_order ON order_payment_adjustments(order_id, id);
   CREATE TABLE IF NOT EXISTS support_messages (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     ticket_id INTEGER NOT NULL,
@@ -584,6 +601,7 @@ function orderView(order) {
     inventoryCommitted: Boolean(order.inventory_committed),
     history: orderTimeline(order.id),
     payments: paymentTimeline(order.id),
+    paymentAdjustments: paymentAdjustmentView(order.id),
     items
   };
 }
@@ -595,6 +613,12 @@ function authTokenFromRequest(req) {
 function requireAdmin(req, res, next) {
   const token = authTokenFromRequest(req);
   if (!token) return res.status(401).json({ error: 'Autenticação necessária.' });
+  if (!['GET', 'HEAD', 'OPTIONS'].includes(req.method) && req.cookies.store_admin) {
+    const origin = req.get('origin');
+    const referer = req.get('referer');
+    const expected = `${req.protocol}://${req.get('host')}`;
+    if ((origin && origin !== expected) || (referer && !referer.startsWith(`${expected}/`))) return res.status(403).json({ error: 'Origem não autorizada.' });
+  }
   try {
     req.admin = jwt.verify(token, JWT_SECRET);
     return next();
@@ -707,6 +731,14 @@ const upload = multer({
   }
 });
 
+app.use((req, res, next) => {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+  res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=()');
+  res.setHeader('Content-Security-Policy', "default-src 'self'; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'");
+  next();
+});
 app.use(express.json({ limit: '1mb' }));
 app.use(express.urlencoded({ extended: true }));
 app.use(cookieParser());
@@ -1158,11 +1190,22 @@ function orderTimeline(orderId) {
   return db.prepare('SELECT id, action, before_json AS beforeJson, after_json AS afterJson, actor_type AS actorType, actor_name AS actorName, reason, created_at AS createdAt FROM order_history WHERE order_id=? ORDER BY id ASC').all(orderId).map(row => ({ ...row, before: JSON.parse(row.beforeJson || '{}'), after: JSON.parse(row.afterJson || '{}') }));
 }
 function paymentTimeline(orderId) {
-  return db.prepare('SELECT id, amount_cents AS amountCents, method, status, due_date AS dueDate, paid_at AS paidAt, failed_at AS failedAt, refunded_at AS refundedAt, reference, notes, created_at AS createdAt FROM order_payments WHERE order_id=? ORDER BY id ASC').all(orderId).map(row => ({ ...row, amount: money(row.amountCents) }));
+  const payments = db.prepare('SELECT id, amount_cents AS amountCents, method, status, due_date AS dueDate, paid_at AS paidAt, failed_at AS failedAt, refunded_at AS refundedAt, reference, notes, created_at AS createdAt FROM order_payments WHERE order_id=? ORDER BY id ASC').all(orderId).map(row => ({ ...row, amount: money(row.amountCents) }));
+  const adjustments = db.prepare('SELECT id, kind, amount_cents AS amountCents, status, reason, due_date AS dueDate, paid_at AS paidAt, refunded_at AS refundedAt, created_at AS createdAt FROM order_payment_adjustments WHERE order_id=? ORDER BY id ASC').all(orderId).map(row => ({ ...row, amount: money(row.amountCents) }));
+  return payments;
+}
+function recordPaymentAdjustment(orderId, changeRequestId, kind, amountCents, reason, dueDate = null) {
+  const amount = Math.abs(Number(amountCents) || 0);
+  if (!amount) return null;
+  const result = db.prepare('INSERT INTO order_payment_adjustments (order_id, change_request_id, kind, amount_cents, status, reason, due_date) VALUES (?, ?, ?, ?, \'pending\', ?, ?)').run(orderId, changeRequestId || null, kind, amount, reason || '', dueDate || null);
+  return Number(result.lastInsertRowid);
+}
+function paymentAdjustmentView(orderId) {
+  return db.prepare('SELECT id, kind, amount_cents AS amountCents, status, reason, due_date AS dueDate, paid_at AS paidAt, refunded_at AS refundedAt, created_at AS createdAt FROM order_payment_adjustments WHERE order_id=? ORDER BY id ASC').all(orderId).map(row => ({ ...row, amount: money(row.amountCents) }));
 }
 function publicOrderView(order) {
   const view = orderView(order);
-  return { orderNumber: order.order_number, accessCode: db.prepare('SELECT code FROM order_access_codes WHERE order_id=?').get(order.id)?.code, customerName: order.customer_name, status: order.status, pickingStatus: order.picking_status, deliveryStatus: order.delivery_status, paymentStatus: order.payment_status, paymentDueDate: order.payment_due_date || null, paymentPaidAt: order.payment_paid_at || null, total: money(order.total_cents), createdAt: order.created_at, updatedAt: order.updated_at, nextStep: order.status === 'pending' ? 'Aguardando confirmação' : order.status === 'confirmed' ? 'Aguardando separação' : order.status === 'preparing' ? 'Separação em andamento' : order.status === 'shipped' ? 'Em entrega' : order.status === 'delivered' ? 'Pedido concluído' : order.status === 'cancelled' ? 'Pedido cancelado' : order.status, items: view.items.map(item => ({ name: item.name, quantity: item.quantity })), timeline: orderTimeline(order.id), payments: paymentTimeline(order.id) };
+  return { orderNumber: order.order_number, accessCode: db.prepare('SELECT code FROM order_access_codes WHERE order_id=?').get(order.id)?.code, customerName: order.customer_name, status: order.status, pickingStatus: order.picking_status, deliveryStatus: order.delivery_status, paymentStatus: order.payment_status, paymentDueDate: order.payment_due_date || null, paymentPaidAt: order.payment_paid_at || null, total: money(order.total_cents), createdAt: order.created_at, updatedAt: order.updated_at, nextStep: order.status === 'pending' ? 'Aguardando confirmação' : order.status === 'confirmed' ? 'Aguardando separação' : order.status === 'preparing' ? 'Separação em andamento' : order.status === 'shipped' ? 'Em entrega' : order.status === 'delivered' ? 'Pedido concluído' : order.status === 'cancelled' ? 'Pedido cancelado' : order.status, items: view.items.map(item => ({ name: item.name, quantity: item.quantity })), timeline: orderTimeline(order.id), payments: paymentTimeline(order.id), paymentAdjustments: paymentAdjustmentView(order.id) };
 }
 app.get('/api/public/order-status', (req, res) => {
   const order = findOrderByAccess(req.query.number, req.query.code, req.query.phone);
@@ -1194,7 +1237,7 @@ app.patch('/api/admin/order-change-requests/:id', requireAdmin, (req, res) => {
   if (!['approved','rejected'].includes(decision)) return res.status(400).json({ error: 'Decisão inválida.' });
   const requested = JSON.parse(request.requested_json || '{}');
   if (decision === 'rejected') {
-    db.prepare("UPDATE order_change_requests SET status='rejected', reviewed_by=?, reviewed_at=CURRENT_TIMESTAMP, reason=? WHERE id=?").run(req.admin?.sub || null, String(req.body.reason || 'Alteração rejeitada'), request.id);
+    db.prepare("UPDATE order_change_requests SET status='rejected', reviewed_by=NULL, reviewed_at=CURRENT_TIMESTAMP, reason=? WHERE id=?").run(String(req.body.reason || 'Alteração rejeitada'), request.id);
     recordOrderHistory(request.order_id, 'change_rejected', { requestId: request.id }, { requestId: request.id, status: 'rejected' }, { type: 'admin', id: req.admin?.sub, name: req.admin?.email }, String(req.body.reason || ''));
     queueNotification(request.customer_phone, 'order_change_rejected', { orderNumber: request.order_number });
     return res.json({ ok: true, status: 'rejected' });
@@ -1214,15 +1257,27 @@ app.patch('/api/admin/order-change-requests/:id', requireAdmin, (req, res) => {
   const shipping = requested.shipping || {};
   const shippingCents = requested.shipping ? Math.max(0, cents(requested.shipping.shippingCents || 0)) : request.shipping_cents;
   const total = subtotal + shippingCents;
+  const oldTotal = Number(request.total_cents || 0);
+  const paidCents = Number(db.prepare("SELECT COALESCE(SUM(amount_cents),0) AS total FROM order_payments WHERE order_id=? AND status='paid'").get(request.order_id).total || 0);
+  const delta = total - oldTotal;
+  const adjustmentKind = delta > 0 ? 'additional_payment' : delta < 0 && paidCents > 0 ? 'refund' : null;
+  const adjustmentAmount = Math.abs(delta);
+  const adjustmentDueDate = String(req.body?.paymentDueDate || '').trim() || null;
   db.transaction(() => {
     db.prepare('DELETE FROM order_items WHERE order_id=?').run(request.order_id);
     const insert = db.prepare('INSERT INTO order_items (order_id, product_id, name_snapshot, quantity, unit_price_cents, unit_vendor_price_cents, unit_cost_cents) VALUES (?, ?, ?, ?, ?, ?, ?)');
     normalized.forEach(item => insert.run(request.order_id, item.product.id, item.product.name, item.quantity, item.pricing.priceCents, item.product.vendor_price_cents, item.pricing.costCents));
-    db.prepare("UPDATE orders SET subtotal_cents=?, shipping_cents=?, total_cents=?, shipping_address=COALESCE(?, shipping_address), shipping_city=COALESCE(?, shipping_city), shipping_state=COALESCE(?, shipping_state), shipping_postal_code=COALESCE(?, shipping_postal_code), shipping_notes=COALESCE(?, shipping_notes), notes=COALESCE(?, notes), updated_at=CURRENT_TIMESTAMP WHERE id=?").run(subtotal, shippingCents, total, shipping.address || null, shipping.city || null, shipping.state || null, shipping.postalCode || null, shipping.notes || null, requested.notes, request.order_id);
-    db.prepare("UPDATE order_change_requests SET status='approved', recalculated_json=?, reviewed_by=?, reviewed_at=CURRENT_TIMESTAMP WHERE id=?").run(JSON.stringify({ subtotalCents: subtotal, shippingCents, totalCents: total }), req.admin?.sub || null, request.id);
+    const nextPaymentStatus = adjustmentKind === 'additional_payment' ? 'partial' : request.payment_status;
+    db.prepare("UPDATE orders SET subtotal_cents=?, shipping_cents=?, total_cents=?, payment_status=?, payment_due_date=CASE WHEN ? IS NOT NULL THEN ? ELSE payment_due_date END, shipping_address=COALESCE(?, shipping_address), shipping_city=COALESCE(?, shipping_city), shipping_state=COALESCE(?, shipping_state), shipping_postal_code=COALESCE(?, shipping_postal_code), shipping_notes=COALESCE(?, shipping_notes), notes=COALESCE(?, notes), updated_at=CURRENT_TIMESTAMP WHERE id=?").run(subtotal, shippingCents, total, nextPaymentStatus, adjustmentDueDate, adjustmentDueDate, shipping.address || null, shipping.city || null, shipping.state || null, shipping.postalCode || null, shipping.notes || null, requested.notes, request.order_id);
+    if (!adjustmentKind && request.payment_status !== 'paid') db.prepare("UPDATE order_payments SET amount_cents=?, due_date=COALESCE(?,due_date), updated_at=CURRENT_TIMESTAMP WHERE order_id=? AND status IN ('pending','failed')").run(total, adjustmentDueDate, request.order_id);
+    let adjustmentId = null;
+    if (adjustmentKind && adjustmentAmount) adjustmentId = recordPaymentAdjustment(request.order_id, request.id, adjustmentKind, adjustmentAmount, adjustmentKind === 'refund' ? 'Estorno gerado por redução do pedido' : 'Diferença gerada por aumento do pedido', adjustmentDueDate);
+    db.prepare("UPDATE order_change_requests SET status='approved', recalculated_json=?, reviewed_by=NULL, reviewed_at=CURRENT_TIMESTAMP WHERE id=?").run(JSON.stringify({ subtotalCents: subtotal, shippingCents, totalCents: total, oldTotalCents: oldTotal, deltaCents: delta, adjustmentId, adjustmentKind }), request.id);
   })();
   recordOrderHistory(request.order_id, 'change_approved', { totalCents: request.total_cents }, { totalCents: total, requestId: request.id }, { type: 'admin', id: req.admin?.sub, name: req.admin?.email });
-  queueNotification(request.customer_phone, 'order_change_approved', { orderNumber: request.order_number, total: money(total) });
+  queueNotification(request.customer_phone, 'order_change_approved', { orderNumber: request.order_number, total: money(total), delta: money(delta), adjustmentKind });
+  if (adjustmentKind === 'additional_payment') queueNotification(request.customer_phone, 'payment_difference_due', { orderNumber: request.order_number, amount: money(adjustmentAmount), dueDate: adjustmentDueDate }, `order:${request.order_id}:adjustment:${request.id}:due`);
+  if (adjustmentKind === 'refund') queueNotification(request.customer_phone, 'refund_pending', { orderNumber: request.order_number, amount: money(adjustmentAmount) }, `order:${request.order_id}:adjustment:${request.id}:refund`);
   res.json({ ok: true, status: 'approved', order: orderView(db.prepare('SELECT * FROM orders WHERE id=?').get(request.order_id)) });
 });
 app.get('/api/internal/order-status', requireWhatsAppInternal, (req, res) => {
@@ -1609,20 +1664,63 @@ app.post('/api/admin/orders/:id/payment', requireAdmin, (req, res) => {
   const id = Number(req.params.id);
   const order = db.prepare('SELECT * FROM orders WHERE id=?').get(id);
   if (!order) return res.status(404).json({ error: 'Pedido não encontrado.' });
-  const status = ['pending','paid','failed','refunded'].includes(req.body?.status) ? req.body.status : order.payment_status;
+  const status = ['pending','partial','paid','failed','refunded'].includes(req.body?.status) ? req.body.status : order.payment_status;
   const dueDate = req.body?.dueDate === undefined ? order.payment_due_date : String(req.body.dueDate || '').trim();
   if (dueDate && !/^\d{4}-\d{2}-\d{2}$/.test(dueDate)) return res.status(400).json({ error: 'Data de vencimento inválida.' });
   const before = { status: order.payment_status, dueDate: order.payment_due_date, paidAt: order.payment_paid_at };
   db.transaction(() => {
     db.prepare('UPDATE orders SET payment_status=?, payment_due_date=?, payment_paid_at=CASE WHEN ?=\'paid\' THEN COALESCE(payment_paid_at,CURRENT_TIMESTAMP) ELSE payment_paid_at END, payment_reminder_sent_at=NULL, updated_at=CURRENT_TIMESTAMP WHERE id=?').run(status, dueDate || null, status, id);
     db.prepare('INSERT OR IGNORE INTO order_payments (order_id, amount_cents, method, status, due_date) VALUES (?, ?, ?, ?, ?)').run(id, order.total_cents, order.payment_method, status, dueDate || null);
-    db.prepare('UPDATE order_payments SET status=?, due_date=?, paid_at=CASE WHEN ?=\'paid\' THEN COALESCE(paid_at,CURRENT_TIMESTAMP) ELSE paid_at END, updated_at=CURRENT_TIMESTAMP WHERE order_id=? AND status NOT IN (\'refunded\')').run(status, dueDate || null, status, id);
+    db.prepare('UPDATE order_payments SET status=?, due_date=?, paid_at=CASE WHEN ?=\'paid\' THEN COALESCE(paid_at,CURRENT_TIMESTAMP) ELSE paid_at END, failed_at=CASE WHEN ?=\'failed\' THEN COALESCE(failed_at,CURRENT_TIMESTAMP) ELSE NULL END, refunded_at=CASE WHEN ?=\'refunded\' THEN COALESCE(refunded_at,CURRENT_TIMESTAMP) ELSE NULL END, updated_at=CURRENT_TIMESTAMP WHERE order_id=? AND status NOT IN (\'refunded\')').run(status, dueDate || null, status, status, status, id);
   })();
   recordOrderHistory(id, 'payment_updated', before, { status, dueDate }, { type:'admin', id:req.admin?.sub, name:req.admin?.email }, String(req.body?.notes || ''));
   if (status === 'paid' && order.payment_status !== 'paid') queueNotification(order.customer_phone, 'payment_paid', { orderNumber: order.order_number, total: money(order.total_cents) }, `order:${id}:payment:paid`);
+  if (status === 'failed' && order.payment_status !== 'failed') queueNotification(order.customer_phone, 'payment_failed', { orderNumber: order.order_number, total: money(order.total_cents) }, `order:${id}:payment:failed`);
+  if (status === 'refunded' && order.payment_status !== 'refunded') queueNotification(order.customer_phone, 'payment_refunded', { orderNumber: order.order_number, total: money(order.total_cents) }, `order:${id}:payment:refunded`);
   if (status !== 'paid') queueNotification(order.customer_phone, 'payment_due', { orderNumber: order.order_number, total: money(order.total_cents), dueDate: dueDate || null }, `order:${id}:payment:${status}:${dueDate || 'none'}`);
   res.json({ order: orderView(db.prepare('SELECT * FROM orders WHERE id=?').get(id)) });
 });
+app.post('/api/admin/orders/:id/operational-event', requireAdmin, (req, res) => {
+  const id = Number(req.params.id);
+  const order = db.prepare('SELECT * FROM orders WHERE id=?').get(id);
+  if (!order) return res.status(404).json({ error: 'Pedido não encontrado.' });
+  const event = String(req.body?.event || '').trim();
+  const allowed = {
+    ready: ['order_ready', 'pedido pronto'],
+    delayed: ['order_delayed', 'pedido atrasado'],
+    picking_issue: ['picking_issue', 'problema na separação'],
+    delivery_nearby: ['delivery_nearby', 'entrega próxima'],
+    delivery_incident: ['delivery_incident', 'incidente na entrega']
+  };
+  if (!allowed[event]) return res.status(400).json({ error: 'Evento operacional inválido.' });
+  const [type, label] = allowed[event];
+  const reason = String(req.body?.reason || label);
+  const key = `order:${id}:operational:${event}:${String(req.body?.key || reason).slice(0,80)}`;
+  queueNotification(order.customer_phone, type, { orderNumber: order.order_number, reason }, key);
+  recordOrderHistory(id, `operational_${event}`, { status: order.status, deliveryStatus: order.delivery_status, pickingStatus: order.picking_status }, { event, reason }, { type: 'admin', id: req.admin?.sub, name: req.admin?.email }, reason);
+  logAudit('admin', req.admin?.sub, req.admin?.email, `operational_${event}`, 'order', id, { reason });
+  res.json({ ok: true, event, notificationKey: key });
+});
+
+app.patch('/api/admin/orders/:id/payment-adjustments/:adjustmentId', requireAdmin, (req, res) => {
+  const orderId = Number(req.params.id), adjustmentId = Number(req.params.adjustmentId);
+  const adjustment = db.prepare('SELECT * FROM order_payment_adjustments WHERE id=? AND order_id=?').get(adjustmentId, orderId);
+  const order = db.prepare('SELECT * FROM orders WHERE id=?').get(orderId);
+  if (!adjustment || !order) return res.status(404).json({ error: 'Ajuste financeiro não encontrado.' });
+  const status = ['pending','paid','failed','refunded'].includes(req.body?.status) ? req.body.status : null;
+  if (!status) return res.status(400).json({ error: 'Status financeiro inválido.' });
+  if (adjustment.kind === 'refund' && status === 'paid') return res.status(400).json({ error: 'Use refunded para liquidar um estorno.' });
+  db.transaction(() => {
+    db.prepare("UPDATE order_payment_adjustments SET status=?, paid_at=CASE WHEN ?='paid' THEN COALESCE(paid_at,CURRENT_TIMESTAMP) ELSE paid_at END, refunded_at=CASE WHEN ?='refunded' THEN COALESCE(refunded_at,CURRENT_TIMESTAMP) ELSE refunded_at END, updated_at=CURRENT_TIMESTAMP WHERE id=?").run(status, status, status, adjustmentId);
+    if (adjustment.kind === 'additional_payment' && status === 'paid') db.prepare("UPDATE orders SET payment_status='paid', payment_paid_at=COALESCE(payment_paid_at,CURRENT_TIMESTAMP), updated_at=CURRENT_TIMESTAMP WHERE id=? AND NOT EXISTS (SELECT 1 FROM order_payment_adjustments WHERE order_id=? AND kind='additional_payment' AND status NOT IN ('paid'))").run(orderId, orderId);
+  })();
+  recordOrderHistory(orderId, 'payment_adjustment_updated', { adjustmentId, status: adjustment.status }, { adjustmentId, status, kind: adjustment.kind, amountCents: adjustment.amount_cents }, { type: 'admin', id: req.admin?.sub, name: req.admin?.email }, String(req.body?.reason || ''));
+  const current = db.prepare('SELECT * FROM order_payment_adjustments WHERE id=?').get(adjustmentId);
+  if (status === 'paid') queueNotification(order.customer_phone, 'payment_difference_paid', { orderNumber: order.order_number, amount: money(adjustment.amount_cents) }, `order:${orderId}:adjustment:${adjustmentId}:paid`);
+  if (status === 'refunded') queueNotification(order.customer_phone, 'refund_completed', { orderNumber: order.order_number, amount: money(adjustment.amount_cents) }, `order:${orderId}:adjustment:${adjustmentId}:refunded`);
+  res.json({ adjustment: { ...current, amount: money(current.amount_cents) }, order: orderView(db.prepare('SELECT * FROM orders WHERE id=?').get(orderId)) });
+});
+
 app.get('/api/admin/expenses', requireAdmin, (_req, res) => {
   const rows = db.prepare('SELECT * FROM expenses WHERE active = 1 ORDER BY expense_date DESC, id DESC LIMIT 500').all();
   res.json({ expenses: rows.map(row => ({ ...row, amount: money(row.amount_cents) })) });
@@ -2119,7 +2217,7 @@ function queuePaymentReminders() {
   const today = new Date();
   const tomorrow = new Date(today.getTime() + 24 * 60 * 60 * 1000);
   const dueLimit = tomorrow.toISOString().slice(0, 10);
-  const rows = db.prepare("SELECT * FROM orders WHERE payment_status='pending' AND payment_due_date IS NOT NULL AND payment_due_date <= ? AND status NOT IN ('cancelled','delivered')").all(dueLimit);
+  const rows = db.prepare("SELECT * FROM orders WHERE payment_status IN ('pending','partial') AND payment_due_date IS NOT NULL AND payment_due_date <= ? AND status NOT IN ('cancelled','delivered')").all(dueLimit);
   for (const order of rows) {
     const reminderKey = `order:${order.id}:payment-reminder:${dueLimit}`;
     const before = db.prepare('SELECT id FROM notifications WHERE idempotency_key=?').get(reminderKey);
