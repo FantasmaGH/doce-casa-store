@@ -1,6 +1,6 @@
 {
   "name": "doce-casa-store",
-  "version": "0.6.5.1",
+  "version": "0.6.5.2",
   "private": true,
   "description": "Catálogo, pedidos e operação completa com vendedores, separação, entregas, atendimento, financeiro e auditoria.",
   "main": "server.js",
@@ -8,7 +8,7 @@
     "start": "node server.js",
     "dev": "node --watch server.js",
     "audit": "node scripts/audit-v64.js",
-    "test:v65": "node scripts/test-v65.js"
+    "test:v65-complete": "node scripts/test-v65-complete.js"
   },
   "engines": {
     "node": ">=18.17.0"

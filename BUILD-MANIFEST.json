@@ -1,0 +1,19 @@
+{
+  "package": "Doce Casa Store",
+  "version": "6.5.2",
+  "base_files": [
+    "doce-casa-store-main (1).zip",
+    "server.js",
+    "whatsapp-service.js",
+    "test-v65.js",
+    "doce-casa-handoff.md",
+    "Auditoria completa — Doce Casa Store no GitHub (2).md"
+  ],
+  "generated_at": "2026-09-12T06:35:26.916744",
+  "validation": [
+    "node --check server.js",
+    "node --check whatsapp-service.js",
+    "node scripts/test-v65-complete.js"
+  ],
+  "note": "Pacote para homologação; não contém .env, banco de produção ou autenticação WhatsApp."
+}

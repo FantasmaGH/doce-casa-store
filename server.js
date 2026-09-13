@@ -12,6 +12,15 @@ const sharp = require('sharp');
 const Database = require('better-sqlite3');
 
 const app = express();
+app.disable('x-powered-by');
+app.use((req,res,next)=>{
+  res.setHeader('X-Content-Type-Options','nosniff');
+  res.setHeader('X-Frame-Options','DENY');
+  res.setHeader('Referrer-Policy','strict-origin-when-cross-origin');
+  res.setHeader('Permissions-Policy','camera=(), microphone=(), geolocation=()');
+  res.setHeader('Content-Security-Policy',"default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'; form-action 'self'");
+  next();
+});
 const PORT = Number(process.env.PORT || 4173);
 const HOST = process.env.HOST || '127.0.0.1';
 const JWT_SECRET = String(process.env.JWT_SECRET || '').trim();
@@ -219,6 +228,75 @@ db.exec(`
     sent_at TEXT,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
   );
+  CREATE TABLE IF NOT EXISTS order_payment_adjustments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    order_id INTEGER NOT NULL,
+    type TEXT NOT NULL,
+    amount_cents INTEGER NOT NULL,
+    reason TEXT NOT NULL DEFAULT '',
+    idempotency_key TEXT UNIQUE,
+    actor_type TEXT NOT NULL DEFAULT 'system',
+    actor_id INTEGER,
+    actor_name TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY(order_id) REFERENCES orders(id) ON DELETE CASCADE
+  );
+  CREATE TABLE IF NOT EXISTS delivery_attempts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    order_id INTEGER NOT NULL,
+    attempt_number INTEGER NOT NULL,
+    status TEXT NOT NULL,
+    reason TEXT NOT NULL DEFAULT '',
+    notes TEXT NOT NULL DEFAULT '',
+    actor_id INTEGER,
+    actor_name TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY(order_id) REFERENCES orders(id) ON DELETE CASCADE
+  );
+  CREATE TABLE IF NOT EXISTS order_operational_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    order_id INTEGER NOT NULL,
+    event_type TEXT NOT NULL,
+    details_json TEXT NOT NULL DEFAULT '{}',
+    idempotency_key TEXT UNIQUE,
+    actor_type TEXT NOT NULL DEFAULT 'system',
+    actor_id INTEGER,
+    actor_name TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY(order_id) REFERENCES orders(id) ON DELETE CASCADE
+  );
+  CREATE TABLE IF NOT EXISTS customer_addresses (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    customer_phone TEXT NOT NULL,
+    label TEXT NOT NULL DEFAULT 'Principal',
+    recipient_name TEXT NOT NULL DEFAULT '',
+    postal_code TEXT NOT NULL DEFAULT '',
+    address TEXT NOT NULL DEFAULT '',
+    city TEXT NOT NULL DEFAULT '',
+    state TEXT NOT NULL DEFAULT '',
+    notes TEXT NOT NULL DEFAULT '',
+    active INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+  );
+  CREATE TABLE IF NOT EXISTS payment_reminder_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    order_id INTEGER NOT NULL,
+    reminder_date TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(order_id, reminder_date, kind),
+    FOREIGN KEY(order_id) REFERENCES orders(id) ON DELETE CASCADE
+  );
+  CREATE TABLE IF NOT EXISTS daily_cash_closures (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    closure_date TEXT NOT NULL UNIQUE,
+    total_cents INTEGER NOT NULL DEFAULT 0,
+    notes TEXT NOT NULL DEFAULT '',
+    closed_by INTEGER,
+    closed_at TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+  );
   CREATE TABLE IF NOT EXISTS support_tickets (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     customer_name TEXT NOT NULL DEFAULT '',
@@ -276,23 +354,6 @@ db.exec(`
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY(order_id) REFERENCES orders(id) ON DELETE CASCADE
   );
-  CREATE TABLE IF NOT EXISTS order_payment_adjustments (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    order_id INTEGER NOT NULL,
-    change_request_id INTEGER,
-    kind TEXT NOT NULL,
-    amount_cents INTEGER NOT NULL,
-    status TEXT NOT NULL DEFAULT 'pending',
-    reason TEXT NOT NULL DEFAULT '',
-    due_date TEXT,
-    paid_at TEXT,
-    refunded_at TEXT,
-    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY(order_id) REFERENCES orders(id) ON DELETE CASCADE,
-    FOREIGN KEY(change_request_id) REFERENCES order_change_requests(id) ON DELETE SET NULL
-  );
-  CREATE INDEX IF NOT EXISTS idx_payment_adjustments_order ON order_payment_adjustments(order_id, id);
   CREATE TABLE IF NOT EXISTS support_messages (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     ticket_id INTEGER NOT NULL,
@@ -310,6 +371,12 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_order_changes_order ON order_change_requests(order_id, id);
   CREATE INDEX IF NOT EXISTS idx_order_payments_order ON order_payments(order_id, id);
   CREATE INDEX IF NOT EXISTS idx_support_messages_ticket ON support_messages(ticket_id, id);
+  CREATE INDEX IF NOT EXISTS idx_payment_adjustments_order ON order_payment_adjustments(order_id, id);
+  CREATE INDEX IF NOT EXISTS idx_delivery_attempts_order ON delivery_attempts(order_id, attempt_number);
+  CREATE INDEX IF NOT EXISTS idx_operational_events_order ON order_operational_events(order_id, id);
+  CREATE INDEX IF NOT EXISTS idx_customer_addresses_phone ON customer_addresses(customer_phone, active, id);
+  CREATE INDEX IF NOT EXISTS idx_payment_reminder_log_order ON payment_reminder_log(order_id, reminder_date, kind);
+
 `);
 
 function ensureColumn(table, column, definition) {
@@ -331,6 +398,7 @@ ensureColumn('orders', 'approved_at', 'TEXT');
 ensureColumn('orders', 'payment_due_date', 'TEXT');
 ensureColumn('orders', 'payment_paid_at', 'TEXT');
 ensureColumn('orders', 'payment_reminder_sent_at', 'TEXT');
+ensureColumn('orders', 'shipping_recipient_name', "TEXT NOT NULL DEFAULT ''");
 ensureColumn('products', 'vendor_price_cents', 'INTEGER NOT NULL DEFAULT 0');
 ensureColumn('order_items', 'unit_vendor_price_cents', 'INTEGER NOT NULL DEFAULT 0');
 ensureColumn('public_links', 'requested_by_staff_id', 'INTEGER');
@@ -359,6 +427,7 @@ CREATE TABLE IF NOT EXISTS campaign_order_history (
 );`);
 ensureColumn('staff_users', 'can_attend', 'INTEGER NOT NULL DEFAULT 0');
 ensureColumn('staff_users', 'can_approve_customers', 'INTEGER NOT NULL DEFAULT 0');
+ensureColumn('staff_users', 'can_approve_orders', 'INTEGER NOT NULL DEFAULT 0');
 ensureColumn('staff_users', 'is_admin', 'INTEGER NOT NULL DEFAULT 0');
 db.exec(`CREATE TABLE IF NOT EXISTS customers (
   id INTEGER PRIMARY KEY AUTOINCREMENT, phone TEXT NOT NULL UNIQUE, preferred_name TEXT NOT NULL, referrer_name TEXT NOT NULL DEFAULT '', referrer_phone TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'approved', approved_by_staff_id INTEGER, approved_at TEXT, rejected_by_staff_id INTEGER, rejected_at TEXT, rejection_reason TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, FOREIGN KEY(approved_by_staff_id) REFERENCES staff_users(id) ON DELETE SET NULL, FOREIGN KEY(rejected_by_staff_id) REFERENCES staff_users(id) ON DELETE SET NULL
@@ -601,7 +670,11 @@ function orderView(order) {
     inventoryCommitted: Boolean(order.inventory_committed),
     history: orderTimeline(order.id),
     payments: paymentTimeline(order.id),
-    paymentAdjustments: paymentAdjustmentView(order.id),
+    paymentAdjustments: orderPaymentAdjustments(order.id),
+    operationalEvents: orderOperationalEvents(order.id),
+    deliveryAttempts: deliveryAttempts(order.id),
+    approvedBy: order.approved_by || null,
+    approvedAt: order.approved_at || null,
     items
   };
 }
@@ -613,12 +686,6 @@ function authTokenFromRequest(req) {
 function requireAdmin(req, res, next) {
   const token = authTokenFromRequest(req);
   if (!token) return res.status(401).json({ error: 'Autenticação necessária.' });
-  if (!['GET', 'HEAD', 'OPTIONS'].includes(req.method) && req.cookies.store_admin) {
-    const origin = req.get('origin');
-    const referer = req.get('referer');
-    const expected = `${req.protocol}://${req.get('host')}`;
-    if ((origin && origin !== expected) || (referer && !referer.startsWith(`${expected}/`))) return res.status(403).json({ error: 'Origem não autorizada.' });
-  }
   try {
     req.admin = jwt.verify(token, JWT_SECRET);
     return next();
@@ -659,6 +726,30 @@ function queueNotification(phone, type, payload = {}, idempotencyKey = null) {
 }
 function recordOrderHistory(orderId, action, before = {}, after = {}, actor = {}, reason = '') {
   db.prepare('INSERT INTO order_history (order_id, action, before_json, after_json, actor_type, actor_id, actor_name, reason) VALUES (?, ?, ?, ?, ?, ?, ?, ?)').run(Number(orderId), action, JSON.stringify(before || {}), JSON.stringify(after || {}), actor.type || 'system', actor.id || null, actor.name || '', reason || '');
+}
+function recordPaymentAdjustment(orderId, type, amountCents, reason, actor = {}, idempotencyKey = null) {
+  const amount = Math.max(0, Math.round(Number(amountCents) || 0));
+  if (!amount) return;
+  db.prepare('INSERT OR IGNORE INTO order_payment_adjustments (order_id, type, amount_cents, reason, idempotency_key, actor_type, actor_id, actor_name) VALUES (?, ?, ?, ?, ?, ?, ?, ?)').run(
+    Number(orderId), type, amount, String(reason || ''), idempotencyKey,
+    actor.type || 'system', actor.id || null, actor.name || ''
+  );
+}
+function recordOperationalEvent(orderId, eventType, details = {}, actor = {}, idempotencyKey = null) {
+  const key = idempotencyKey || `order:${Number(orderId)}:event:${eventType}:${crypto.createHash('sha256').update(JSON.stringify(details)).digest('hex').slice(0,16)}`;
+  const result = db.prepare('INSERT OR IGNORE INTO order_operational_events (order_id,event_type,details_json,idempotency_key,actor_type,actor_id,actor_name) VALUES (?,?,?,?,?,?,?)').run(
+    Number(orderId), String(eventType), JSON.stringify(details || {}), key, actor.type || 'system', actor.id || null, actor.name || ''
+  );
+  return result.changes > 0;
+}
+function deliveryAttempts(orderId) {
+  return db.prepare('SELECT id,attempt_number AS attemptNumber,status,reason,notes,actor_id AS actorId,actor_name AS actorName,created_at AS createdAt FROM delivery_attempts WHERE order_id=? ORDER BY attempt_number ASC').all(orderId);
+}
+function orderOperationalEvents(orderId) {
+  return db.prepare('SELECT id,event_type AS eventType,details_json AS detailsJson,actor_type AS actorType,actor_id AS actorId,actor_name AS actorName,created_at AS createdAt FROM order_operational_events WHERE order_id=? ORDER BY id ASC').all(orderId).map(r => ({...r, details: JSON.parse(r.detailsJson || '{}')}));
+}
+function orderPaymentAdjustments(orderId) {
+  return db.prepare('SELECT id,type,amount_cents AS amountCents,reason,actor_type AS actorType,actor_id AS actorId,actor_name AS actorName,created_at AS createdAt FROM order_payment_adjustments WHERE order_id=? ORDER BY id ASC').all(orderId).map(r=>({...r,amount:money(r.amountCents)}));
 }
 function recordSupportMessage(ticketId, direction, senderType, senderId, senderName, body, messageType = 'text', deliveryStatus = 'received') {
   if (!String(body || '').trim()) return;
@@ -703,9 +794,9 @@ function requireCampaignAccess(req,res,next) {
 function campaignAccessCookie(res, token) { res.cookie('campaign_access', token, {httpOnly:true,sameSite:'lax',secure:process.env.NODE_ENV==='production',maxAge:Math.round(campaignLinkHours()*3600000),path:'/'}); }
 
 function nextOrderNumber() {
-  const date = new Date().toISOString().slice(0, 10).replace(/-/g, '');
-  const suffix = crypto.randomBytes(3).toString('hex').toUpperCase();
-  return `PED-${date}-${suffix}`;
+  const row = db.prepare("SELECT COALESCE(MAX(CAST(SUBSTR(order_number,4) AS INTEGER)),0) AS lastNumber FROM orders WHERE order_number GLOB 'DC-[0-9]*'").get();
+  const next = Number(row?.lastNumber || 0) + 1;
+  return `DC-${String(next).padStart(6, '0')}`;
 }
 
 function nextCampaignOrderNumber() {
@@ -731,14 +822,6 @@ const upload = multer({
   }
 });
 
-app.use((req, res, next) => {
-  res.setHeader('X-Content-Type-Options', 'nosniff');
-  res.setHeader('X-Frame-Options', 'DENY');
-  res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
-  res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=()');
-  res.setHeader('Content-Security-Policy', "default-src 'self'; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'");
-  next();
-});
 app.use(express.json({ limit: '1mb' }));
 app.use(express.urlencoded({ extended: true }));
 app.use(cookieParser());
@@ -787,7 +870,7 @@ app.get('/api/auth/me', requireAdmin, (req, res) => {
 });
 
 app.get('/api/admin/staff', requireAdmin, (_req, res) => {
-  const staff = db.prepare('SELECT id, name, phone, active, can_sell AS canSell, can_pick AS canPick, can_deliver AS canDeliver, can_view_financial AS canViewFinancial, can_manage_products AS canManageProducts, can_attend AS canAttend, can_approve_customers AS canApproveCustomers, is_admin AS isAdmin, created_at AS createdAt, updated_at AS updatedAt FROM staff_users ORDER BY active DESC, name COLLATE NOCASE').all();
+  const staff = db.prepare('SELECT id, name, phone, active, can_sell AS canSell, can_pick AS canPick, can_deliver AS canDeliver, can_view_financial AS canViewFinancial, can_manage_products AS canManageProducts, can_attend AS canAttend, can_approve_customers AS canApproveCustomers, can_approve_orders AS canApproveOrders, is_admin AS isAdmin, created_at AS createdAt, updated_at AS updatedAt FROM staff_users ORDER BY active DESC, name COLLATE NOCASE').all();
   res.json({ staff });
 });
 
@@ -797,7 +880,7 @@ app.post('/api/admin/staff', requireAdmin, (req, res) => {
   const phone = normalizePhone(body.phone);
   if (!name || phone.length < 8) return res.status(400).json({ error: 'Informe nome e telefone válido.' });
   try {
-    const result = db.prepare('INSERT INTO staff_users (name, phone, can_sell, can_pick, can_deliver, can_view_financial, can_manage_products, can_attend, can_approve_customers, is_admin) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').run(name, phone, body.canSell ? 1 : 0, body.canPick ? 1 : 0, body.canDeliver ? 1 : 0, body.canViewFinancial ? 1 : 0, body.canManageProducts ? 1 : 0, body.canAttend ? 1 : 0, body.canApproveCustomers ? 1 : 0, body.isAdmin ? 1 : 0);
+    const result = db.prepare('INSERT INTO staff_users (name, phone, can_sell, can_pick, can_deliver, can_view_financial, can_manage_products, can_attend, can_approve_customers, can_approve_orders, is_admin) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').run(name, phone, body.canSell ? 1 : 0, body.canPick ? 1 : 0, body.canDeliver ? 1 : 0, body.canViewFinancial ? 1 : 0, body.canManageProducts ? 1 : 0, body.canAttend ? 1 : 0, body.canApproveCustomers ? 1 : 0, body.canApproveOrders ? 1 : 0, body.isAdmin ? 1 : 0);
     logAudit('admin', req.admin?.sub, req.admin?.email, 'staff_created', 'staff', result.lastInsertRowid, { name, phone });
     res.status(201).json({ staff: db.prepare('SELECT * FROM staff_users WHERE id = ?').get(result.lastInsertRowid) });
   } catch (error) { res.status(409).json({ error: error.code === 'SQLITE_CONSTRAINT_UNIQUE' ? 'Este telefone já está cadastrado.' : error.message }); }
@@ -810,7 +893,7 @@ app.patch('/api/admin/staff/:id', requireAdmin, (req, res) => {
   const body = req.body || {};
   const name = String(body.name ?? current.name).trim();
   const phone = normalizePhone(body.phone ?? current.phone);
-  db.prepare('UPDATE staff_users SET name = ?, phone = ?, active = ?, can_sell = ?, can_pick = ?, can_deliver = ?, can_view_financial = ?, can_manage_products = ?, can_attend = ?, can_approve_customers = ?, is_admin = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?').run(name, phone, body.active === undefined ? current.active : (body.active ? 1 : 0), body.canSell === undefined ? current.can_sell : (body.canSell ? 1 : 0), body.canPick === undefined ? current.can_pick : (body.canPick ? 1 : 0), body.canDeliver === undefined ? current.can_deliver : (body.canDeliver ? 1 : 0), body.canViewFinancial === undefined ? current.can_view_financial : (body.canViewFinancial ? 1 : 0), body.canManageProducts === undefined ? current.can_manage_products : (body.canManageProducts ? 1 : 0), body.canAttend === undefined ? current.can_attend : (body.canAttend ? 1 : 0), body.canApproveCustomers === undefined ? current.can_approve_customers : (body.canApproveCustomers ? 1 : 0), body.isAdmin === undefined ? current.is_admin : (body.isAdmin ? 1 : 0), id);
+  db.prepare('UPDATE staff_users SET name = ?, phone = ?, active = ?, can_sell = ?, can_pick = ?, can_deliver = ?, can_view_financial = ?, can_manage_products = ?, can_attend = ?, can_approve_customers = ?, can_approve_orders = ?, is_admin = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?').run(name, phone, body.active === undefined ? current.active : (body.active ? 1 : 0), body.canSell === undefined ? current.can_sell : (body.canSell ? 1 : 0), body.canPick === undefined ? current.can_pick : (body.canPick ? 1 : 0), body.canDeliver === undefined ? current.can_deliver : (body.canDeliver ? 1 : 0), body.canViewFinancial === undefined ? current.can_view_financial : (body.canViewFinancial ? 1 : 0), body.canManageProducts === undefined ? current.can_manage_products : (body.canManageProducts ? 1 : 0), body.canAttend === undefined ? current.can_attend : (body.canAttend ? 1 : 0), body.canApproveCustomers === undefined ? current.can_approve_customers : (body.canApproveCustomers ? 1 : 0), body.canApproveOrders === undefined ? current.can_approve_orders : (body.canApproveOrders ? 1 : 0), body.isAdmin === undefined ? current.is_admin : (body.isAdmin ? 1 : 0), id);
   logAudit('admin', req.admin?.sub, req.admin?.email, 'staff_updated', 'staff', id, { name, phone });
   res.json({ staff: db.prepare('SELECT * FROM staff_users WHERE id = ?').get(id) });
 });
@@ -1190,22 +1273,11 @@ function orderTimeline(orderId) {
   return db.prepare('SELECT id, action, before_json AS beforeJson, after_json AS afterJson, actor_type AS actorType, actor_name AS actorName, reason, created_at AS createdAt FROM order_history WHERE order_id=? ORDER BY id ASC').all(orderId).map(row => ({ ...row, before: JSON.parse(row.beforeJson || '{}'), after: JSON.parse(row.afterJson || '{}') }));
 }
 function paymentTimeline(orderId) {
-  const payments = db.prepare('SELECT id, amount_cents AS amountCents, method, status, due_date AS dueDate, paid_at AS paidAt, failed_at AS failedAt, refunded_at AS refundedAt, reference, notes, created_at AS createdAt FROM order_payments WHERE order_id=? ORDER BY id ASC').all(orderId).map(row => ({ ...row, amount: money(row.amountCents) }));
-  const adjustments = db.prepare('SELECT id, kind, amount_cents AS amountCents, status, reason, due_date AS dueDate, paid_at AS paidAt, refunded_at AS refundedAt, created_at AS createdAt FROM order_payment_adjustments WHERE order_id=? ORDER BY id ASC').all(orderId).map(row => ({ ...row, amount: money(row.amountCents) }));
-  return payments;
-}
-function recordPaymentAdjustment(orderId, changeRequestId, kind, amountCents, reason, dueDate = null) {
-  const amount = Math.abs(Number(amountCents) || 0);
-  if (!amount) return null;
-  const result = db.prepare('INSERT INTO order_payment_adjustments (order_id, change_request_id, kind, amount_cents, status, reason, due_date) VALUES (?, ?, ?, ?, \'pending\', ?, ?)').run(orderId, changeRequestId || null, kind, amount, reason || '', dueDate || null);
-  return Number(result.lastInsertRowid);
-}
-function paymentAdjustmentView(orderId) {
-  return db.prepare('SELECT id, kind, amount_cents AS amountCents, status, reason, due_date AS dueDate, paid_at AS paidAt, refunded_at AS refundedAt, created_at AS createdAt FROM order_payment_adjustments WHERE order_id=? ORDER BY id ASC').all(orderId).map(row => ({ ...row, amount: money(row.amountCents) }));
+  return db.prepare('SELECT id, amount_cents AS amountCents, method, status, due_date AS dueDate, paid_at AS paidAt, failed_at AS failedAt, refunded_at AS refundedAt, reference, notes, created_at AS createdAt FROM order_payments WHERE order_id=? ORDER BY id ASC').all(orderId).map(row => ({ ...row, amount: money(row.amountCents) }));
 }
 function publicOrderView(order) {
   const view = orderView(order);
-  return { orderNumber: order.order_number, accessCode: db.prepare('SELECT code FROM order_access_codes WHERE order_id=?').get(order.id)?.code, customerName: order.customer_name, status: order.status, pickingStatus: order.picking_status, deliveryStatus: order.delivery_status, paymentStatus: order.payment_status, paymentDueDate: order.payment_due_date || null, paymentPaidAt: order.payment_paid_at || null, total: money(order.total_cents), createdAt: order.created_at, updatedAt: order.updated_at, nextStep: order.status === 'pending' ? 'Aguardando confirmação' : order.status === 'confirmed' ? 'Aguardando separação' : order.status === 'preparing' ? 'Separação em andamento' : order.status === 'shipped' ? 'Em entrega' : order.status === 'delivered' ? 'Pedido concluído' : order.status === 'cancelled' ? 'Pedido cancelado' : order.status, items: view.items.map(item => ({ name: item.name, quantity: item.quantity })), timeline: orderTimeline(order.id), payments: paymentTimeline(order.id), paymentAdjustments: paymentAdjustmentView(order.id) };
+  return { orderNumber: order.order_number, accessCode: db.prepare('SELECT code FROM order_access_codes WHERE order_id=?').get(order.id)?.code, customerName: order.customer_name, status: order.status, pickingStatus: order.picking_status, deliveryStatus: order.delivery_status, paymentStatus: order.payment_status, paymentDueDate: order.payment_due_date || null, paymentPaidAt: order.payment_paid_at || null, paymentAmountDue: order.payment_status === 'paid' ? 0 : money(order.total_cents), recipientName: order.shipping_recipient_name || null, total: money(order.total_cents), createdAt: order.created_at, updatedAt: order.updated_at, nextStep: order.status === 'pending' ? 'Aguardando confirmação' : order.status === 'confirmed' ? 'Aguardando separação' : order.status === 'preparing' ? 'Separação em andamento' : order.status === 'shipped' ? 'Em entrega' : order.status === 'delivered' ? 'Pedido concluído' : order.status === 'cancelled' ? 'Pedido cancelado' : order.status, items: view.items.map(item => ({ name: item.name, quantity: item.quantity })), timeline: orderTimeline(order.id), payments: paymentTimeline(order.id) };
 }
 app.get('/api/public/order-status', (req, res) => {
   const order = findOrderByAccess(req.query.number, req.query.code, req.query.phone);
@@ -1216,18 +1288,36 @@ app.post('/api/public/orders/:number/change-requests', (req, res) => {
   const body = req.body || {};
   const order = findOrderByAccess(req.params.number, body.code, body.phone);
   if (!order) return res.status(404).json({ error: 'Pedido não encontrado com esse código.' });
-  if (order.status === 'cancelled' || order.status === 'delivered' || order.inventory_committed || !['waiting','separating'].includes(order.picking_status)) return res.status(409).json({ error: 'Este pedido não pode mais ser alterado nesta etapa.' });
-  const requestedItems = Array.isArray(body.items) ? body.items.map(item => ({ productId: Number(item.productId), quantity: Number(item.quantity) })).filter(item => Number.isInteger(item.productId) && Number.isFinite(item.quantity) && item.quantity > 0) : null;
+  if (['cancelled','delivered'].includes(order.status) || ['separated','blocked'].includes(order.picking_status)) {
+    return res.status(409).json({ error: 'Este pedido não pode mais ser alterado nesta etapa.' });
+  }
+  if (order.delivery_status === 'route' || order.delivery_status === 'delivered') {
+    return res.status(409).json({ error: 'Este pedido já está em entrega e não pode ser alterado.' });
+  }
+  const requestedItems = Array.isArray(body.items)
+    ? body.items.map(item => ({ productId: Number(item.productId), quantity: Number(item.quantity) }))
+      .filter(item => Number.isInteger(item.productId) && Number.isFinite(item.quantity) && item.quantity > 0)
+    : null;
   if (requestedItems && !requestedItems.length) return res.status(400).json({ error: 'Informe pelo menos um item válido.' });
-  const requested = { items: requestedItems, shipping: body.shipping || null, notes: body.notes === undefined ? null : String(body.notes) };
-  const request = db.prepare('INSERT INTO order_change_requests (order_id, access_code, customer_phone, requested_json, reason) VALUES (?, ?, ?, ?, ?)').run(order.id, String(body.code || '').toUpperCase(), normalizePhone(body.phone), JSON.stringify(requested), String(body.reason || 'Solicitação do cliente'));
-  recordOrderHistory(order.id, 'change_requested', { status: order.status }, { requestId: request.lastInsertRowid, requested }, { type: 'customer', name: order.customer_name });
+  const requested = {
+    items: requestedItems,
+    shipping: body.shipping || null,
+    notes: body.notes === undefined ? null : String(body.notes),
+    requestedAt: new Date().toISOString()
+  };
+  const request = db.prepare('INSERT INTO order_change_requests (order_id, access_code, customer_phone, requested_json, reason) VALUES (?, ?, ?, ?, ?)').run(
+    order.id, String(body.code || '').toUpperCase(), normalizePhone(body.phone), JSON.stringify(requested), String(body.reason || 'Solicitação do cliente')
+  );
+  recordOrderHistory(order.id, 'change_requested', { status: order.status, totalCents: order.total_cents }, { requestId: request.lastInsertRowid, requested }, { type: 'customer', name: order.customer_name });
+  queueStaffNotification('sell', 'order_change_requested', { orderNumber: order.order_number, customerName: order.customer_name, requestId: request.lastInsertRowid });
   queueStaffNotification('pick', 'order_change_requested', { orderNumber: order.order_number, customerName: order.customer_name, requestId: request.lastInsertRowid });
-  queueNotification(order.customer_phone, 'order_change_received', { orderNumber: order.order_number });
-  res.status(201).json({ requestId: request.lastInsertRowid, status: 'pending', message: 'Solicitação recebida e encaminhada para análise.' });
+  queueNotification(order.customer_phone, 'order_change_received', { orderNumber: order.order_number, requestId: request.lastInsertRowid }, `order:${order.id}:change:${request.lastInsertRowid}:received`);
+  res.status(201).json({ requestId: request.lastInsertRowid, status: 'pending', message: 'Solicitação recebida. A equipe verificará o estágio, estoque e diferença de valor.' });
 });
 app.get('/api/admin/order-change-requests', requireAdmin, (_req, res) => {
-  const rows = db.prepare(`SELECT r.*, o.order_number, o.customer_name, o.customer_phone, o.status AS order_status FROM order_change_requests r JOIN orders o ON o.id=r.order_id WHERE r.status='pending' ORDER BY r.id ASC LIMIT 200`).all().map(row => ({ ...row, requested: JSON.parse(row.requested_json || '{}'), recalculated: JSON.parse(row.recalculated_json || '{}') }));
+  const rows = db.prepare(`SELECT r.*, o.order_number, o.customer_name, o.customer_phone, o.status AS order_status, o.total_cents AS current_total_cents
+    FROM order_change_requests r JOIN orders o ON o.id=r.order_id WHERE r.status='pending' ORDER BY r.id ASC LIMIT 200`).all()
+    .map(row => ({ ...row, requested: JSON.parse(row.requested_json || '{}'), recalculated: JSON.parse(row.recalculated_json || '{}'), currentTotal: money(row.current_total_cents) }));
   res.json({ requests: rows });
 });
 app.patch('/api/admin/order-change-requests/:id', requireAdmin, (req, res) => {
@@ -1237,48 +1327,95 @@ app.patch('/api/admin/order-change-requests/:id', requireAdmin, (req, res) => {
   if (!['approved','rejected'].includes(decision)) return res.status(400).json({ error: 'Decisão inválida.' });
   const requested = JSON.parse(request.requested_json || '{}');
   if (decision === 'rejected') {
-    db.prepare("UPDATE order_change_requests SET status='rejected', reviewed_by=NULL, reviewed_at=CURRENT_TIMESTAMP, reason=? WHERE id=?").run(String(req.body.reason || 'Alteração rejeitada'), request.id);
-    recordOrderHistory(request.order_id, 'change_rejected', { requestId: request.id }, { requestId: request.id, status: 'rejected' }, { type: 'admin', id: req.admin?.sub, name: req.admin?.email }, String(req.body.reason || ''));
-    queueNotification(request.customer_phone, 'order_change_rejected', { orderNumber: request.order_number });
+    const reason = String(req.body.reason || 'Alteração rejeitada');
+    db.prepare("UPDATE order_change_requests SET status='rejected', reviewed_by=?, reviewed_at=CURRENT_TIMESTAMP, reason=? WHERE id=?").run(req.admin?.sub || null, reason, request.id);
+    recordOrderHistory(request.order_id, 'change_rejected', { requestId: request.id }, { requestId: request.id, status: 'rejected' }, { type: 'admin', id: req.admin?.sub, name: req.admin?.email }, reason);
+    queueNotification(request.customer_phone, 'order_change_rejected', { orderNumber: request.order_number, reason }, `order:${request.order_id}:change:${request.id}:rejected`);
     return res.json({ ok: true, status: 'rejected' });
   }
-  const requestedItems = Array.isArray(requested.items) && requested.items.length
-    ? requested.items
-    : db.prepare('SELECT product_id AS productId, quantity FROM order_items WHERE order_id=?').all(request.order_id);
-  if (!requestedItems.length) return res.status(400).json({ error: 'O pedido não possui itens para recalcular.' });
+
+  if (['cancelled','delivered'].includes(request.status) || ['separated','blocked'].includes(request.picking_status) || request.delivery_status === 'route') {
+    return res.status(409).json({ error: 'O pedido avançou de etapa e não pode mais receber esta alteração.' });
+  }
+
+  const currentItems = db.prepare('SELECT * FROM order_items WHERE order_id=? ORDER BY id').all(request.order_id);
+  const existingByProduct = new Map(currentItems.map(item => [Number(item.product_id), item]));
+  const requestedItems = Array.isArray(requested.items) ? requested.items : currentItems.map(i => ({ productId:i.product_id, quantity:i.quantity }));
   const normalized = [];
   for (const item of requestedItems) {
-    const product = db.prepare('SELECT * FROM products WHERE id=? AND active=1').get(item.productId);
+    const productId = Number(item.productId), quantity = Number(item.quantity);
+    if (!Number.isInteger(productId) || !Number.isFinite(quantity) || quantity <= 0) return res.status(400).json({ error: 'Item ou quantidade inválida na alteração.' });
+    const product = db.prepare('SELECT * FROM products WHERE id=? AND active=1').get(productId);
     if (!product) return res.status(409).json({ error: 'Produto indisponível na alteração.' });
-    if (product.availability === 'ready' && Number(product.stock_qty) < item.quantity) return res.status(409).json({ error: `Estoque insuficiente para ${product.name}.` });
-    normalized.push({ product, quantity: item.quantity, pricing: priceForQuantity(product, item.quantity) });
+    const previous = existingByProduct.get(productId);
+    const pricing = previous
+      ? { priceCents: Number(previous.unit_price_cents), costCents: Number(previous.unit_cost_cents), vendorPriceCents: Number(previous.unit_vendor_price_cents) }
+      : (() => { const p=priceForQuantity(product, quantity); return { priceCents:p.priceCents, costCents:p.costCents, vendorPriceCents:Number(product.vendor_price_cents) }; })();
+    normalized.push({ product, quantity, pricing, previous });
   }
   const subtotal = normalized.reduce((sum, item) => sum + Math.round(item.quantity * item.pricing.priceCents), 0);
   const shipping = requested.shipping || {};
-  const shippingCents = requested.shipping ? Math.max(0, cents(requested.shipping.shippingCents || 0)) : request.shipping_cents;
+  const shippingCents = requested.shipping ? Math.max(0, cents(shipping.shippingCents || 0)) : Number(request.shipping_cents || 0);
   const total = subtotal + shippingCents;
-  const oldTotal = Number(request.total_cents || 0);
-  const paidCents = Number(db.prepare("SELECT COALESCE(SUM(amount_cents),0) AS total FROM order_payments WHERE order_id=? AND status='paid'").get(request.order_id).total || 0);
-  const delta = total - oldTotal;
-  const adjustmentKind = delta > 0 ? 'additional_payment' : delta < 0 && paidCents > 0 ? 'refund' : null;
-  const adjustmentAmount = Math.abs(delta);
-  const adjustmentDueDate = String(req.body?.paymentDueDate || '').trim() || null;
-  db.transaction(() => {
+  const delta = total - Number(request.total_cents);
+
+  const update = db.transaction(() => {
+    // If stock was already committed, only the quantity delta is applied atomically.
+    if (request.inventory_committed) {
+      for (const oldItem of currentItems) {
+        const next = normalized.find(x => x.product.id === Number(oldItem.product_id));
+        const nextQty = next ? next.quantity : 0;
+        const deltaQty = nextQty - Number(oldItem.quantity);
+        if (deltaQty > 0) {
+          const r = db.prepare('UPDATE products SET stock_qty=stock_qty-?,updated_at=CURRENT_TIMESTAMP WHERE id=? AND stock_qty>=?').run(deltaQty, oldItem.product_id, deltaQty);
+          if (!r.changes) throw new Error(`Estoque insuficiente para ${oldItem.name_snapshot}.`);
+          db.prepare("INSERT INTO stock_movements(product_id,type,quantity,unit_cost_cents,note) VALUES(?, 'out', ?, ?, ?)").run(oldItem.product_id, deltaQty, oldItem.unit_cost_cents, `Acréscimo na alteração ${request.order_number}`);
+        } else if (deltaQty < 0) {
+          db.prepare('UPDATE products SET stock_qty=stock_qty+?,updated_at=CURRENT_TIMESTAMP WHERE id=?').run(Math.abs(deltaQty), oldItem.product_id);
+          db.prepare("INSERT INTO stock_movements(product_id,type,quantity,unit_cost_cents,note) VALUES(?, 'in', ?, ?, ?)").run(oldItem.product_id, Math.abs(deltaQty), oldItem.unit_cost_cents, `Redução na alteração ${request.order_number}`);
+        }
+      }
+      for (const next of normalized.filter(x => !existingByProduct.has(x.product.id))) {
+        if (next.product.availability === 'ready') {
+          const r=db.prepare('UPDATE products SET stock_qty=stock_qty-?,updated_at=CURRENT_TIMESTAMP WHERE id=? AND stock_qty>=?').run(next.quantity,next.product.id,next.quantity);
+          if(!r.changes) throw new Error(`Estoque insuficiente para ${next.product.name}.`);
+          db.prepare("INSERT INTO stock_movements(product_id,type,quantity,unit_cost_cents,note) VALUES(?, 'out', ?, ?, ?)").run(next.product.id,next.quantity,next.pricing.costCents,`Novo item na alteração ${request.order_number}`);
+        }
+      }
+    }
+
     db.prepare('DELETE FROM order_items WHERE order_id=?').run(request.order_id);
-    const insert = db.prepare('INSERT INTO order_items (order_id, product_id, name_snapshot, quantity, unit_price_cents, unit_vendor_price_cents, unit_cost_cents) VALUES (?, ?, ?, ?, ?, ?, ?)');
-    normalized.forEach(item => insert.run(request.order_id, item.product.id, item.product.name, item.quantity, item.pricing.priceCents, item.product.vendor_price_cents, item.pricing.costCents));
-    const nextPaymentStatus = adjustmentKind === 'additional_payment' ? 'partial' : request.payment_status;
-    db.prepare("UPDATE orders SET subtotal_cents=?, shipping_cents=?, total_cents=?, payment_status=?, payment_due_date=CASE WHEN ? IS NOT NULL THEN ? ELSE payment_due_date END, shipping_address=COALESCE(?, shipping_address), shipping_city=COALESCE(?, shipping_city), shipping_state=COALESCE(?, shipping_state), shipping_postal_code=COALESCE(?, shipping_postal_code), shipping_notes=COALESCE(?, shipping_notes), notes=COALESCE(?, notes), updated_at=CURRENT_TIMESTAMP WHERE id=?").run(subtotal, shippingCents, total, nextPaymentStatus, adjustmentDueDate, adjustmentDueDate, shipping.address || null, shipping.city || null, shipping.state || null, shipping.postalCode || null, shipping.notes || null, requested.notes, request.order_id);
-    if (!adjustmentKind && request.payment_status !== 'paid') db.prepare("UPDATE order_payments SET amount_cents=?, due_date=COALESCE(?,due_date), updated_at=CURRENT_TIMESTAMP WHERE order_id=? AND status IN ('pending','failed')").run(total, adjustmentDueDate, request.order_id);
-    let adjustmentId = null;
-    if (adjustmentKind && adjustmentAmount) adjustmentId = recordPaymentAdjustment(request.order_id, request.id, adjustmentKind, adjustmentAmount, adjustmentKind === 'refund' ? 'Estorno gerado por redução do pedido' : 'Diferença gerada por aumento do pedido', adjustmentDueDate);
-    db.prepare("UPDATE order_change_requests SET status='approved', recalculated_json=?, reviewed_by=NULL, reviewed_at=CURRENT_TIMESTAMP WHERE id=?").run(JSON.stringify({ subtotalCents: subtotal, shippingCents, totalCents: total, oldTotalCents: oldTotal, deltaCents: delta, adjustmentId, adjustmentKind }), request.id);
+    const insert = db.prepare('INSERT INTO order_items (order_id,product_id,name_snapshot,quantity,unit_price_cents,unit_vendor_price_cents,unit_cost_cents) VALUES (?,?,?,?,?,?,?)');
+    normalized.forEach(item=>insert.run(request.order_id,item.product.id,item.product.name,item.quantity,item.pricing.priceCents,item.pricing.vendorPriceCents,item.pricing.costCents));
+
+    let nextPaymentStatus = request.payment_status;
+    let refundPending = 0;
+    if (delta > 0) {
+      nextPaymentStatus = 'pending';
+      db.prepare('UPDATE orders SET subtotal_cents=?,shipping_cents=?,total_cents=?,payment_status=?,payment_due_date=?,payment_paid_at=NULL,payment_reminder_sent_at=NULL,shipping_address=COALESCE(?,shipping_address),shipping_city=COALESCE(?,shipping_city),shipping_state=COALESCE(?,shipping_state),shipping_postal_code=COALESCE(?,shipping_postal_code),shipping_notes=COALESCE(?,shipping_notes),shipping_recipient_name=COALESCE(?,shipping_recipient_name),notes=COALESCE(?,notes),updated_at=CURRENT_TIMESTAMP WHERE id=?')
+        .run(subtotal,shippingCents,total,nextPaymentStatus,new Date().toISOString().slice(0,10),shipping.address||null,shipping.city||null,shipping.state||null,shipping.postalCode||null,shipping.notes||null,shipping.recipientName||null,requested.notes,request.order_id);
+      recordPaymentAdjustment(request.order_id,'balance_due',delta,'Aumento de total após alteração',{type:'admin',id:req.admin?.sub,name:req.admin?.email},`order:${request.order_id}:change:${request.id}:balance`);
+    } else if (delta < 0) {
+      if (request.payment_status === 'paid') {
+        refundPending = Math.abs(delta);
+        db.prepare('UPDATE orders SET subtotal_cents=?,shipping_cents=?,total_cents=?,shipping_address=COALESCE(?,shipping_address),shipping_city=COALESCE(?,shipping_city),shipping_state=COALESCE(?,shipping_state),shipping_postal_code=COALESCE(?,shipping_postal_code),shipping_notes=COALESCE(?,shipping_notes),shipping_recipient_name=COALESCE(?,shipping_recipient_name),notes=COALESCE(?,notes),updated_at=CURRENT_TIMESTAMP WHERE id=?').run(subtotal,shippingCents,total,shipping.address||null,shipping.city||null,shipping.state||null,shipping.postalCode||null,shipping.notes||null,shipping.recipientName||null,requested.notes,request.order_id);
+        recordPaymentAdjustment(request.order_id,'refund_pending',refundPending,'Redução de total em pedido já pago',{type:'admin',id:req.admin?.sub,name:req.admin?.email},`order:${request.order_id}:change:${request.id}:refund`);
+      } else {
+        db.prepare('UPDATE orders SET subtotal_cents=?,shipping_cents=?,total_cents=?,shipping_address=COALESCE(?,shipping_address),shipping_city=COALESCE(?,shipping_city),shipping_state=COALESCE(?,shipping_state),shipping_postal_code=COALESCE(?,shipping_postal_code),shipping_notes=COALESCE(?,shipping_notes),shipping_recipient_name=COALESCE(?,shipping_recipient_name),notes=COALESCE(?,notes),updated_at=CURRENT_TIMESTAMP WHERE id=?').run(subtotal,shippingCents,total,shipping.address||null,shipping.city||null,shipping.state||null,shipping.postalCode||null,shipping.notes||null,shipping.recipientName||null,requested.notes,request.order_id);
+        recordPaymentAdjustment(request.order_id,'credit',Math.abs(delta),'Redução de total antes do pagamento',{type:'admin',id:req.admin?.sub,name:req.admin?.email},`order:${request.order_id}:change:${request.id}:credit`);
+      }
+    } else {
+      db.prepare('UPDATE orders SET subtotal_cents=?,shipping_cents=?,total_cents=?,shipping_address=COALESCE(?,shipping_address),shipping_city=COALESCE(?,shipping_city),shipping_state=COALESCE(?,shipping_state),shipping_postal_code=COALESCE(?,shipping_postal_code),shipping_notes=COALESCE(?,shipping_notes),shipping_recipient_name=COALESCE(?,shipping_recipient_name),notes=COALESCE(?,notes),updated_at=CURRENT_TIMESTAMP WHERE id=?')
+        .run(subtotal,shippingCents,total,shipping.address||null,shipping.city||null,shipping.state||null,shipping.postalCode||null,shipping.notes||null,shipping.recipientName||null,requested.notes,request.order_id);
+    }
+    db.prepare("UPDATE order_change_requests SET status='approved',recalculated_json=?,reviewed_by=?,reviewed_at=CURRENT_TIMESTAMP WHERE id=?").run(JSON.stringify({subtotalCents:subtotal,shippingCents,totalCents:total,deltaCents:delta}),req.admin?.sub||null,request.id);
   })();
-  recordOrderHistory(request.order_id, 'change_approved', { totalCents: request.total_cents }, { totalCents: total, requestId: request.id }, { type: 'admin', id: req.admin?.sub, name: req.admin?.email });
-  queueNotification(request.customer_phone, 'order_change_approved', { orderNumber: request.order_number, total: money(total), delta: money(delta), adjustmentKind });
-  if (adjustmentKind === 'additional_payment') queueNotification(request.customer_phone, 'payment_difference_due', { orderNumber: request.order_number, amount: money(adjustmentAmount), dueDate: adjustmentDueDate }, `order:${request.order_id}:adjustment:${request.id}:due`);
-  if (adjustmentKind === 'refund') queueNotification(request.customer_phone, 'refund_pending', { orderNumber: request.order_number, amount: money(adjustmentAmount) }, `order:${request.order_id}:adjustment:${request.id}:refund`);
-  res.json({ ok: true, status: 'approved', order: orderView(db.prepare('SELECT * FROM orders WHERE id=?').get(request.order_id)) });
+
+  const finalOrder=db.prepare('SELECT * FROM orders WHERE id=?').get(request.order_id);
+  recordOrderHistory(request.order_id,'change_approved',{totalCents:request.total_cents,paymentStatus:request.payment_status},{totalCents:total,deltaCents:delta,requestId:request.id,paymentStatus:finalOrder.payment_status},{type:'admin',id:req.admin?.sub,name:req.admin?.email});
+  queueNotification(request.customer_phone,'order_change_approved',{orderNumber:request.order_number,total:money(total),difference:money(Math.abs(delta)),differenceType:delta>0?'additional_payment':delta<0?'credit_or_refund':'none'},`order:${request.order_id}:change:${request.id}:approved`);
+  if(delta>0) queueNotification(request.customer_phone,'payment_due',{orderNumber:request.order_number,total:money(total),dueDate:finalOrder.payment_due_date,message:'Há diferença a pagar após a alteração.'},`order:${request.order_id}:change:${request.id}:payment`);
+  return res.json({ok:true,status:'approved',order:orderView(finalOrder)});
 });
 app.get('/api/internal/order-status', requireWhatsAppInternal, (req, res) => {
   const order = findOrderByAccess(req.query.number, req.query.code, req.query.phone);
@@ -1290,6 +1427,11 @@ app.post('/api/public/orders', requireCatalogAccess, (req, res) => {
   const body = req.body || {};
   const customer = body.customer || {};
   const shipping = body.shipping || {};
+  if (shipping.addressId) {
+    const savedAddress = db.prepare('SELECT * FROM customer_addresses WHERE id=? AND customer_phone=? AND active=1').get(Number(shipping.addressId), normalizePhone(customer.phone));
+    if (!savedAddress) return res.status(400).json({ error: 'Endereço salvo não encontrado para este cliente.' });
+    Object.assign(shipping, { postalCode:savedAddress.postal_code, address:savedAddress.address, city:savedAddress.city, state:savedAddress.state, notes:savedAddress.notes, recipientName:savedAddress.recipient_name });
+  }
   const items = Array.isArray(body.items) ? body.items : [];
   if (!String(customer.name || '').trim() || !String(customer.phone || '').trim() || !items.length) {
     return res.status(400).json({ error: 'Informe nome, telefone e pelo menos um produto.' });
@@ -1336,10 +1478,10 @@ app.post('/api/public/orders', requireCatalogAccess, (req, res) => {
     const result = db.prepare(`
       INSERT INTO orders (
         order_number, customer_name, customer_phone, customer_email,
-        shipping_postal_code, shipping_address, shipping_city, shipping_state,
+        shipping_postal_code, shipping_address, shipping_city, shipping_state, shipping_recipient_name,
         shipping_notes, payment_method, payment_status, status,
-        subtotal_cents, shipping_cents, total_cents, source, notes, salesperson_id, campaign_id
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 'pending', ?, ?, ?, ?, ?, ?, ?)
+        subtotal_cents, shipping_cents, total_cents, source, notes, salesperson_id, campaign_id, payment_due_date
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       orderNumber,
       String(customer.name).trim(),
@@ -1349,6 +1491,7 @@ app.post('/api/public/orders', requireCatalogAccess, (req, res) => {
       String(shipping.address || '').trim(),
       String(shipping.city || '').trim(),
       String(shipping.state || '').trim(),
+      String(shipping.recipientName || '').trim(),
       String(shipping.notes || '').trim(),
       String(body.paymentMethod || 'a_combinar'),
       subtotalCents,
@@ -1357,7 +1500,8 @@ app.post('/api/public/orders', requireCatalogAccess, (req, res) => {
       salespersonId ? 'seller_link' : String(body.source || 'site'),
       String(body.notes || '').trim(),
       salespersonId || null,
-      campaignId
+      campaignId,
+      today
     );
     const insertItem = db.prepare(`
       INSERT INTO order_items (order_id, product_id, name_snapshot, quantity, unit_price_cents, unit_vendor_price_cents, unit_cost_cents)
@@ -1374,7 +1518,8 @@ app.post('/api/public/orders', requireCatalogAccess, (req, res) => {
   recordOrderHistory(order.id, 'created', {}, { status: order.status, paymentStatus: order.payment_status, totalCents: order.total_cents }, { type: 'system', name: salespersonId ? (db.prepare('SELECT name FROM staff_users WHERE id = ?').get(salespersonId)?.name || '') : '' });
   db.prepare('INSERT OR IGNORE INTO order_payments (order_id, amount_cents, method, status, due_date) VALUES (?, ?, ?, ?, ?)').run(order.id, order.total_cents, order.payment_method, order.payment_status, order.payment_due_date || null);
   logAudit('system', null, salespersonId ? (db.prepare('SELECT name FROM staff_users WHERE id = ?').get(salespersonId)?.name || '') : '', 'order_created', 'order', order.id, { source: order.source, salespersonId });
-  queueNotification(order.customer_phone, 'order_created', { orderNumber: order.order_number, total: money(order.total_cents) });
+  queueNotification(order.customer_phone, 'order_created', { orderNumber: order.order_number, total: money(order.total_cents), paymentDueDate: order.payment_due_date, message: 'Pagamento previsto para hoje. Se já pagou, desconsidere este aviso.' }, `order:${order.id}:created`);
+  queueNotification(order.customer_phone, 'payment_due', { orderNumber: order.order_number, total: money(order.total_cents), dueDate: order.payment_due_date, message: 'Pagamento até hoje. Se já realizou o pagamento, desconsidere este aviso.' }, `order:${order.id}:payment:initial`);
   if (salespersonId) queueNotification(db.prepare('SELECT phone FROM staff_users WHERE id = ?').get(salespersonId)?.phone, 'new_sale', { orderNumber: order.order_number, customerName: order.customer_name, total: money(order.total_cents) });
   res.status(201).json({ order: { ...orderView(order), accessCode, salespersonId } });
 });
@@ -1655,6 +1800,45 @@ app.patch('/api/admin/orders/:id', requireAdmin, (req, res) => {
   res.json({ order: orderView(row) });
 });
 
+app.post('/api/admin/orders/:id/approve', requireAdmin, (req,res)=>{
+  const id=Number(req.params.id);
+  const current=db.prepare('SELECT * FROM orders WHERE id=?').get(id);
+  if(!current)return res.status(404).json({error:'Pedido não encontrado.'});
+  if(current.status!=='pending')return res.status(409).json({error:'Somente pedidos pendentes podem ser aprovados.'});
+  if(current.payment_status!=='paid')return res.status(409).json({error:'O pedido precisa estar pago antes da aprovação.'});
+  try{
+    db.transaction(()=>{
+      if(!current.inventory_committed)commitInventory(id);
+      db.prepare("UPDATE orders SET status='confirmed', approved_by=?, approved_at=CURRENT_TIMESTAMP, updated_at=CURRENT_TIMESTAMP WHERE id=?").run(req.admin?.sub||null,id);
+    })();
+    const row=db.prepare('SELECT * FROM orders WHERE id=?').get(id);
+    recordOrderHistory(id,'approved',{status:current.status,paymentStatus:current.payment_status},{status:'confirmed',approvedBy:req.admin?.email||''},{type:'admin',id:req.admin?.sub,name:req.admin?.email});
+    recordOperationalEvent(id,'confirmed',{});
+    queueNotification(row.customer_phone,'order_confirmed',{orderNumber:row.order_number,total:money(row.total_cents)},`order:${id}:status:confirmed`);
+    queueStaffNotification('pick','new_picking',{orderNumber:row.order_number,customerName:row.customer_name});
+    logAudit('admin',req.admin?.sub,req.admin?.email,'order_approved','order',id,{});
+    res.json({ok:true,order:orderView(row)});
+  }catch(e){res.status(409).json({error:e.message});}
+});
+app.post('/api/internal/staff/orders/:id/approve', requireWhatsAppInternal, (req,res)=>{
+  const staff=staffByPhone(req.body?.phone);
+  if(!staff || !(staff.is_admin || staff.can_approve_orders || staff.can_sell))return res.status(403).json({error:'Sem permissão para aprovar pedidos.'});
+  const rawId=String(req.params.id||'');
+  const current=db.prepare(/^\\d+$/.test(rawId) ? 'SELECT * FROM orders WHERE id=?' : 'SELECT * FROM orders WHERE order_number=?').get(/^\\d+$/.test(rawId) ? Number(rawId) : rawId.toUpperCase());
+  if(!current)return res.status(404).json({error:'Pedido não encontrado.'});
+  const id=Number(current.id);
+  if(current.status!=='pending' || current.payment_status!=='paid')return res.status(409).json({error:'Pedido precisa estar pendente e pago para aprovação.'});
+  try{
+    db.transaction(()=>{if(!current.inventory_committed)commitInventory(id);db.prepare("UPDATE orders SET status='confirmed',approved_by=?,approved_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP WHERE id=?").run(staff.id,id)})();
+    const row=db.prepare('SELECT * FROM orders WHERE id=?').get(id);
+    recordOrderHistory(id,'approved',{status:current.status},{status:'confirmed',approvedBy:staff.name},{type:'staff',id:staff.id,name:staff.name});
+    recordOperationalEvent(id,'confirmed',{},{type:'staff',id:staff.id,name:staff.name},`order:${id}:event:confirmed`);
+    queueNotification(row.customer_phone,'order_confirmed',{orderNumber:row.order_number,total:money(row.total_cents)},`order:${id}:status:confirmed`);
+    queueStaffNotification('pick','new_picking',{orderNumber:row.order_number,customerName:row.customer_name});
+    logAudit('staff',staff.id,staff.name,'order_approved','order',id,{});
+    res.json({ok:true,order:orderView(row)});
+  }catch(e){res.status(409).json({error:e.message});}
+});
 app.get('/api/admin/orders/:id/history', requireAdmin, (req, res) => {
   const order = db.prepare('SELECT id FROM orders WHERE id=?').get(Number(req.params.id));
   if (!order) return res.status(404).json({ error: 'Pedido não encontrado.' });
@@ -1664,63 +1848,69 @@ app.post('/api/admin/orders/:id/payment', requireAdmin, (req, res) => {
   const id = Number(req.params.id);
   const order = db.prepare('SELECT * FROM orders WHERE id=?').get(id);
   if (!order) return res.status(404).json({ error: 'Pedido não encontrado.' });
-  const status = ['pending','partial','paid','failed','refunded'].includes(req.body?.status) ? req.body.status : order.payment_status;
+  const status = ['pending','paid','failed','refunded'].includes(req.body?.status) ? req.body.status : order.payment_status;
   const dueDate = req.body?.dueDate === undefined ? order.payment_due_date : String(req.body.dueDate || '').trim();
   if (dueDate && !/^\d{4}-\d{2}-\d{2}$/.test(dueDate)) return res.status(400).json({ error: 'Data de vencimento inválida.' });
+  const todayPayment = new Date().toISOString().slice(0,10);
+  if (status === 'pending' && dueDate && dueDate !== todayPayment) return res.status(400).json({ error: 'Pedidos normais devem ter pagamento no mesmo dia. Campanhas possuem calendário próprio.' });
   const before = { status: order.payment_status, dueDate: order.payment_due_date, paidAt: order.payment_paid_at };
   db.transaction(() => {
     db.prepare('UPDATE orders SET payment_status=?, payment_due_date=?, payment_paid_at=CASE WHEN ?=\'paid\' THEN COALESCE(payment_paid_at,CURRENT_TIMESTAMP) ELSE payment_paid_at END, payment_reminder_sent_at=NULL, updated_at=CURRENT_TIMESTAMP WHERE id=?').run(status, dueDate || null, status, id);
     db.prepare('INSERT OR IGNORE INTO order_payments (order_id, amount_cents, method, status, due_date) VALUES (?, ?, ?, ?, ?)').run(id, order.total_cents, order.payment_method, status, dueDate || null);
-    db.prepare('UPDATE order_payments SET status=?, due_date=?, paid_at=CASE WHEN ?=\'paid\' THEN COALESCE(paid_at,CURRENT_TIMESTAMP) ELSE paid_at END, failed_at=CASE WHEN ?=\'failed\' THEN COALESCE(failed_at,CURRENT_TIMESTAMP) ELSE NULL END, refunded_at=CASE WHEN ?=\'refunded\' THEN COALESCE(refunded_at,CURRENT_TIMESTAMP) ELSE NULL END, updated_at=CURRENT_TIMESTAMP WHERE order_id=? AND status NOT IN (\'refunded\')').run(status, dueDate || null, status, status, status, id);
+    db.prepare('UPDATE order_payments SET status=?, due_date=?, paid_at=CASE WHEN ?=\'paid\' THEN COALESCE(paid_at,CURRENT_TIMESTAMP) ELSE paid_at END, updated_at=CURRENT_TIMESTAMP WHERE order_id=? AND status NOT IN (\'refunded\')').run(status, dueDate || null, status, id);
   })();
   recordOrderHistory(id, 'payment_updated', before, { status, dueDate }, { type:'admin', id:req.admin?.sub, name:req.admin?.email }, String(req.body?.notes || ''));
   if (status === 'paid' && order.payment_status !== 'paid') queueNotification(order.customer_phone, 'payment_paid', { orderNumber: order.order_number, total: money(order.total_cents) }, `order:${id}:payment:paid`);
-  if (status === 'failed' && order.payment_status !== 'failed') queueNotification(order.customer_phone, 'payment_failed', { orderNumber: order.order_number, total: money(order.total_cents) }, `order:${id}:payment:failed`);
-  if (status === 'refunded' && order.payment_status !== 'refunded') queueNotification(order.customer_phone, 'payment_refunded', { orderNumber: order.order_number, total: money(order.total_cents) }, `order:${id}:payment:refunded`);
   if (status !== 'paid') queueNotification(order.customer_phone, 'payment_due', { orderNumber: order.order_number, total: money(order.total_cents), dueDate: dueDate || null }, `order:${id}:payment:${status}:${dueDate || 'none'}`);
   res.json({ order: orderView(db.prepare('SELECT * FROM orders WHERE id=?').get(id)) });
 });
-app.post('/api/admin/orders/:id/operational-event', requireAdmin, (req, res) => {
-  const id = Number(req.params.id);
-  const order = db.prepare('SELECT * FROM orders WHERE id=?').get(id);
-  if (!order) return res.status(404).json({ error: 'Pedido não encontrado.' });
-  const event = String(req.body?.event || '').trim();
-  const allowed = {
-    ready: ['order_ready', 'pedido pronto'],
-    delayed: ['order_delayed', 'pedido atrasado'],
-    picking_issue: ['picking_issue', 'problema na separação'],
-    delivery_nearby: ['delivery_nearby', 'entrega próxima'],
-    delivery_incident: ['delivery_incident', 'incidente na entrega']
-  };
-  if (!allowed[event]) return res.status(400).json({ error: 'Evento operacional inválido.' });
-  const [type, label] = allowed[event];
-  const reason = String(req.body?.reason || label);
-  const key = `order:${id}:operational:${event}:${String(req.body?.key || reason).slice(0,80)}`;
-  queueNotification(order.customer_phone, type, { orderNumber: order.order_number, reason }, key);
-  recordOrderHistory(id, `operational_${event}`, { status: order.status, deliveryStatus: order.delivery_status, pickingStatus: order.picking_status }, { event, reason }, { type: 'admin', id: req.admin?.sub, name: req.admin?.email }, reason);
-  logAudit('admin', req.admin?.sub, req.admin?.email, `operational_${event}`, 'order', id, { reason });
-  res.json({ ok: true, event, notificationKey: key });
+app.post('/api/admin/orders/:id/refund', requireAdmin, (req,res)=>{
+  const id=Number(req.params.id),order=db.prepare('SELECT * FROM orders WHERE id=?').get(id);
+  if(!order)return res.status(404).json({error:'Pedido não encontrado.'});
+  if(order.payment_status!=='paid' && order.payment_status!=='refunded')return res.status(409).json({error:'Somente pedidos pagos podem receber estorno.'});
+  const amount=Math.max(0,Math.min(Number(order.total_cents),req.body?.amount===undefined?Number(order.total_cents):cents(req.body.amount)));
+  if(!amount)return res.status(400).json({error:'Valor de estorno inválido.'});
+  const key=String(req.body?.idempotencyKey||`order:${id}:refund:${amount}`);
+  try{
+    db.transaction(()=>{
+      db.prepare("UPDATE orders SET payment_status='refunded',updated_at=CURRENT_TIMESTAMP WHERE id=?").run(id);
+      db.prepare("UPDATE order_payments SET status='refunded',refunded_at=COALESCE(refunded_at,CURRENT_TIMESTAMP),updated_at=CURRENT_TIMESTAMP WHERE order_id=? AND status='paid'").run(id);
+      recordPaymentAdjustment(id,'refund',amount,String(req.body?.reason||'Estorno'),{type:'admin',id:req.admin?.sub,name:req.admin?.email},key);
+      recordOrderHistory(id,'payment_refunded',{paymentStatus:order.payment_status},{paymentStatus:'refunded',amountCents:amount},{type:'admin',id:req.admin?.sub,name:req.admin?.email});
+    })();
+    queueNotification(order.customer_phone,'payment_refunded',{orderNumber:order.order_number,amount:money(amount)},`order:${id}:payment:refunded:${amount}`);
+    res.json({ok:true,order:orderView(db.prepare('SELECT * FROM orders WHERE id=?').get(id))});
+  }catch(e){res.status(409).json({error:e.message});}
 });
-
-app.patch('/api/admin/orders/:id/payment-adjustments/:adjustmentId', requireAdmin, (req, res) => {
-  const orderId = Number(req.params.id), adjustmentId = Number(req.params.adjustmentId);
-  const adjustment = db.prepare('SELECT * FROM order_payment_adjustments WHERE id=? AND order_id=?').get(adjustmentId, orderId);
-  const order = db.prepare('SELECT * FROM orders WHERE id=?').get(orderId);
-  if (!adjustment || !order) return res.status(404).json({ error: 'Ajuste financeiro não encontrado.' });
-  const status = ['pending','paid','failed','refunded'].includes(req.body?.status) ? req.body.status : null;
-  if (!status) return res.status(400).json({ error: 'Status financeiro inválido.' });
-  if (adjustment.kind === 'refund' && status === 'paid') return res.status(400).json({ error: 'Use refunded para liquidar um estorno.' });
-  db.transaction(() => {
-    db.prepare("UPDATE order_payment_adjustments SET status=?, paid_at=CASE WHEN ?='paid' THEN COALESCE(paid_at,CURRENT_TIMESTAMP) ELSE paid_at END, refunded_at=CASE WHEN ?='refunded' THEN COALESCE(refunded_at,CURRENT_TIMESTAMP) ELSE refunded_at END, updated_at=CURRENT_TIMESTAMP WHERE id=?").run(status, status, status, adjustmentId);
-    if (adjustment.kind === 'additional_payment' && status === 'paid') db.prepare("UPDATE orders SET payment_status='paid', payment_paid_at=COALESCE(payment_paid_at,CURRENT_TIMESTAMP), updated_at=CURRENT_TIMESTAMP WHERE id=? AND NOT EXISTS (SELECT 1 FROM order_payment_adjustments WHERE order_id=? AND kind='additional_payment' AND status NOT IN ('paid'))").run(orderId, orderId);
-  })();
-  recordOrderHistory(orderId, 'payment_adjustment_updated', { adjustmentId, status: adjustment.status }, { adjustmentId, status, kind: adjustment.kind, amountCents: adjustment.amount_cents }, { type: 'admin', id: req.admin?.sub, name: req.admin?.email }, String(req.body?.reason || ''));
-  const current = db.prepare('SELECT * FROM order_payment_adjustments WHERE id=?').get(adjustmentId);
-  if (status === 'paid') queueNotification(order.customer_phone, 'payment_difference_paid', { orderNumber: order.order_number, amount: money(adjustment.amount_cents) }, `order:${orderId}:adjustment:${adjustmentId}:paid`);
-  if (status === 'refunded') queueNotification(order.customer_phone, 'refund_completed', { orderNumber: order.order_number, amount: money(adjustment.amount_cents) }, `order:${orderId}:adjustment:${adjustmentId}:refunded`);
-  res.json({ adjustment: { ...current, amount: money(current.amount_cents) }, order: orderView(db.prepare('SELECT * FROM orders WHERE id=?').get(orderId)) });
+app.post('/api/admin/orders/:id/delivery-attempt', requireAdmin, (req,res)=>{
+  const id=Number(req.params.id),order=db.prepare('SELECT * FROM orders WHERE id=?').get(id);
+  if(!order)return res.status(404).json({error:'Pedido não encontrado.'});
+  const status=['success','failed','customer_absent','address_issue','incident'].includes(req.body?.status)?req.body.status:'failed';
+  const reason=String(req.body?.reason||'').trim(),notes=String(req.body?.notes||'').trim();
+  const last=db.prepare('SELECT COALESCE(MAX(attempt_number),0) n FROM delivery_attempts WHERE order_id=?').get(id);
+  const attempt=Number(last.n)+1;
+  db.prepare('INSERT INTO delivery_attempts(order_id,attempt_number,status,reason,notes,actor_id,actor_name) VALUES(?,?,?,?,?,?,?)').run(id,attempt,status,reason,notes,req.admin?.sub||null,req.admin?.email||'');
+  recordOperationalEvent(id,'delivery_attempt',{attempt,status,reason,notes},{type:'admin',id:req.admin?.sub,name:req.admin?.email},`order:${id}:delivery-attempt:${attempt}`);
+  if(status!=='success')queueNotification(order.customer_phone,'delivery_incident',{orderNumber:order.order_number,attempt,reason,notes},`order:${id}:delivery:attempt:${attempt}`);
+  logAudit('admin',req.admin?.sub,req.admin?.email,'delivery_attempt_recorded','order',id,{attempt,status,reason});
+  res.status(201).json({attempt:db.prepare('SELECT * FROM delivery_attempts WHERE order_id=? AND attempt_number=?').get(id,attempt),order:orderView(order)});
 });
-
+app.post('/api/admin/orders/:id/operational-event', requireAdmin, (req,res)=>{
+  const id=Number(req.params.id),order=db.prepare('SELECT * FROM orders WHERE id=?').get(id);
+  if(!order)return res.status(404).json({error:'Pedido não encontrado.'});
+  const allowed=['ready','delayed','picking_issue','delivery_nearby','delivery_incident','missing_item','alteration_requested','alteration_approved','alteration_rejected','cancelled'];
+  const eventType=String(req.body?.eventType||'');
+  if(!allowed.includes(eventType))return res.status(400).json({error:'Evento operacional inválido.'});
+  const details=req.body?.details&&typeof req.body.details==='object'?req.body.details:{};
+  const created=recordOperationalEvent(id,eventType,details,{type:'admin',id:req.admin?.sub,name:req.admin?.email},req.body?.idempotencyKey||null);
+  recordOrderHistory(id,eventType,{},details,{type:'admin',id:req.admin?.sub,name:req.admin?.email},String(req.body?.reason||''));
+  queueNotification(order.customer_phone,eventType,{orderNumber:order.order_number,...details},`order:${id}:event:${eventType}`);
+  queueStaffNotification(eventType==='delivery_nearby'||eventType==='delivery_incident'?'deliver':eventType==='picking_issue'||eventType==='missing_item'?'pick':'attend',eventType,{orderNumber:order.order_number,...details});
+  res.status(created?201:200).json({ok:true,created,events:orderOperationalEvents(id)});
+});
+app.get('/api/admin/payment-settings', requireAdmin, (_req,res)=>{
+  res.json({pixKey:process.env.PIX_KEY||'',pixName:process.env.PIX_NAME||'',pixCity:process.env.PIX_CITY||'',normalOrderPaymentSameDay:true});
+});
 app.get('/api/admin/expenses', requireAdmin, (_req, res) => {
   const rows = db.prepare('SELECT * FROM expenses WHERE active = 1 ORDER BY expense_date DESC, id DESC LIMIT 500').all();
   res.json({ expenses: rows.map(row => ({ ...row, amount: money(row.amount_cents) })) });
@@ -1736,7 +1926,7 @@ app.post('/api/admin/expenses', requireAdmin, (req, res) => {
     description, amountCents, String(req.body.category || 'outros'), expenseDate, campaignId
   );
   const row = db.prepare('SELECT * FROM expenses WHERE id = ?').get(result.lastInsertRowid);
-  logAudit('admin',req.admin?.sub,req.admin?.email,'expense_created','expense',result.lastInsertRowid,{description,amountCents,expenseDate,category});
+  logAudit('admin',req.admin?.sub,req.admin?.email,'expense_created','expense',result.lastInsertRowid,{description,amountCents,expenseDate,category:String(req.body.category || 'outros')});
   res.status(201).json({ expense: { ...row, amount: money(row.amount_cents) } });
 });
 
@@ -2045,6 +2235,7 @@ app.get('/api/admin/dashboard', requireAdmin, (_req, res) => {
   `).get();
   const expenses = db.prepare('SELECT COALESCE(SUM(amount_cents), 0) AS expenses_cents FROM expenses WHERE active = 1').get();
   const pending = db.prepare("SELECT COUNT(*) AS count FROM orders WHERE status = 'pending'").get();
+  const balanceDue = db.prepare("SELECT COALESCE(SUM(total_cents),0) AS cents FROM orders WHERE status != 'cancelled' AND payment_status = 'pending'").get();
   const lowStock = db.prepare("SELECT COUNT(*) AS count FROM products WHERE active = 1 AND availability = 'ready' AND stock_qty <= low_stock_threshold").get();
   const supportOpen = db.prepare("SELECT COUNT(*) AS count FROM support_tickets WHERE status IN ('open','assigned')").get();
   const openOrders = db.prepare("SELECT * FROM orders WHERE status != 'cancelled' ORDER BY id DESC LIMIT 8").all();
@@ -2066,6 +2257,7 @@ app.get('/api/admin/dashboard', requireAdmin, (_req, res) => {
     pendingOrders: Number(pending.count),
     lowStock: Number(lowStock.count),
     supportOpen: Number(supportOpen.count),
+    balanceDue: money(balanceDue.cents),
     openOrders: openOrders.map(orderView)
   });
 });
@@ -2099,6 +2291,31 @@ app.post('/api/admin/whatsapp/logout', requireAdmin, async (_req, res) => {
   catch (error) { res.status(503).json({ error: error.message }); }
 });
 
+app.get('/api/internal/customer-addresses', requireWhatsAppInternal, (req,res)=>{
+  const phone=normalizePhone(req.query.phone);
+  if(phone.length<8)return res.status(400).json({error:'Número inválido.'});
+  const addresses=db.prepare('SELECT id,label,recipient_name AS recipientName,postal_code AS postalCode,address,city,state,notes,active,created_at AS createdAt,updated_at AS updatedAt FROM customer_addresses WHERE customer_phone=? AND active=1 ORDER BY id DESC').all(phone);
+  res.json({addresses});
+});
+app.post('/api/internal/customer-addresses', requireWhatsAppInternal, (req,res)=>{
+  const phone=normalizePhone(req.body?.phone);
+  if(phone.length<8)return res.status(400).json({error:'Número inválido.'});
+  const address=String(req.body?.address||'').trim(),city=String(req.body?.city||'').trim(),state=String(req.body?.state||'').trim();
+  if(!address||!city||!state)return res.status(400).json({error:'Informe endereço, cidade e estado.'});
+  const r=db.prepare('INSERT INTO customer_addresses(customer_phone,label,recipient_name,postal_code,address,city,state,notes) VALUES(?,?,?,?,?,?,?,?)').run(phone,String(req.body?.label||'Principal').trim(),String(req.body?.recipientName||'').trim(),String(req.body?.postalCode||'').trim(),address,city,state,String(req.body?.notes||'').trim());
+  res.status(201).json({address:db.prepare('SELECT * FROM customer_addresses WHERE id=?').get(r.lastInsertRowid)});
+});
+app.patch('/api/internal/customer-addresses/:id', requireWhatsAppInternal, (req,res)=>{
+  const id=Number(req.params.id),current=db.prepare('SELECT * FROM customer_addresses WHERE id=?').get(id);
+  if(!current)return res.status(404).json({error:'Endereço não encontrado.'});
+  const phone=normalizePhone(req.body?.phone);
+  if(phone!==current.customer_phone)return res.status(403).json({error:'Endereço não pertence ao telefone informado.'});
+  db.prepare('UPDATE customer_addresses SET label=?,recipient_name=?,postal_code=?,address=?,city=?,state=?,notes=?,active=?,updated_at=CURRENT_TIMESTAMP WHERE id=?').run(
+    String(req.body?.label??current.label),String(req.body?.recipientName??current.recipient_name),String(req.body?.postalCode??current.postal_code),
+    String(req.body?.address??current.address),String(req.body?.city??current.city),String(req.body?.state??current.state),String(req.body?.notes??current.notes),
+    req.body?.active===undefined?current.active:(req.body.active?1:0),id);
+  res.json({address:db.prepare('SELECT * FROM customer_addresses WHERE id=?').get(id)});
+});
 app.get('/api/internal/notifications/pending', requireWhatsAppInternal, (_req, res) => {
   const rows = db.prepare("SELECT * FROM notifications WHERE sent_at IS NULL ORDER BY id ASC LIMIT 100").all();
   res.json({ notifications: rows.map(row => ({ id: row.id, phone: row.phone, type: row.type, payload: JSON.parse(row.payload_json || '{}') })) });
@@ -2214,16 +2431,22 @@ app.use((error, _req, res, _next) => {
 
 function queuePaymentReminders() {
   if (String(process.env.PAYMENT_REMINDER_ENABLED || 'true').toLowerCase() !== 'true') return;
-  const today = new Date();
-  const tomorrow = new Date(today.getTime() + 24 * 60 * 60 * 1000);
-  const dueLimit = tomorrow.toISOString().slice(0, 10);
-  const rows = db.prepare("SELECT * FROM orders WHERE payment_status IN ('pending','partial') AND payment_due_date IS NOT NULL AND payment_due_date <= ? AND status NOT IN ('cancelled','delivered')").all(dueLimit);
+  const today = new Date().toISOString().slice(0, 10);
+  const tomorrow = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+  const rows = db.prepare("SELECT * FROM orders WHERE payment_status='pending' AND payment_due_date IS NOT NULL AND payment_due_date <= ? AND status NOT IN ('cancelled','delivered')").all(tomorrow);
   for (const order of rows) {
-    const reminderKey = `order:${order.id}:payment-reminder:${dueLimit}`;
-    const before = db.prepare('SELECT id FROM notifications WHERE idempotency_key=?').get(reminderKey);
-    if (before) continue;
-    queueNotification(order.customer_phone, 'payment_due', { orderNumber: order.order_number, total: money(order.total_cents), dueDate: order.payment_due_date }, reminderKey);
-    db.prepare('UPDATE orders SET payment_reminder_sent_at=CURRENT_TIMESTAMP WHERE id=?').run(order.id);
+    if (order.payment_status === 'paid' || order.payment_status === 'refunded') continue;
+    const kind = order.payment_due_date < today ? 'overdue' : 'due_today';
+    const exists = db.prepare('SELECT id FROM payment_reminder_log WHERE order_id=? AND reminder_date=? AND kind=?').get(order.id,today,kind);
+    if (exists) continue;
+    const reminderKey = `order:${order.id}:payment-reminder:${today}:${kind}`;
+    const created = db.transaction(()=>{
+      const r=db.prepare('INSERT OR IGNORE INTO payment_reminder_log(order_id,reminder_date,kind) VALUES(?,?,?)').run(order.id,today,kind);
+      if(!r.changes)return false;
+      queueNotification(order.customer_phone,'payment_reminder',{orderNumber:order.order_number,total:money(order.total_cents),dueDate:order.payment_due_date,overdue:kind==='overdue',message:kind==='overdue'?'Pagamento em atraso. Se já pagou, desconsidere este aviso.':'Pagamento previsto para hoje. Se já pagou, desconsidere este aviso.'},reminderKey);
+      db.prepare('UPDATE orders SET payment_reminder_sent_at=CURRENT_TIMESTAMP WHERE id=?').run(order.id);
+      return true;
+    })();
   }
 }
 queuePaymentReminders();

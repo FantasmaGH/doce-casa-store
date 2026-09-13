@@ -102,16 +102,16 @@ function attachClientEvents(instance) {
         }
         return message.reply(`📅 Campanhas disponíveis:\n\n${lines.join('\n\n')}`);
       }
-      if (body === '3' || body === 'status' || body === 'pedido') return message.reply('📦 Envie o código do pedido. Exemplo: status PED-20260907-ABC123');
-      const orderMatch = body.match(/(?:pedido|status)\s+([a-z0-9-]+)/i);
+      if (body === '3' || body === 'status' || body === 'pedido') return message.reply('📦 Envie o código do pedido. Exemplo: status DC-000123');
+      const orderMatch = body.match(/(?:pedido|status)\s+((?:ped-[a-z0-9-]+|dc-\d{6}))/i);
       if (orderMatch) return replyOrderStatus(message, phone, orderMatch[1]);
-      if (/^ped-[a-z0-9-]+$/i.test(body)) return replyOrderStatus(message, phone, body);
-      const changeMatch = body.match(/^alterar\s+(ped-[a-z0-9-]+)\s+(cod-[a-z0-9-]+)\s+([\s\S]+)$/i);
+      if (/^(?:ped-[a-z0-9-]+|dc-\d{6})$/i.test(body)) return replyOrderStatus(message, phone, body);
+      const changeMatch = body.match(/^alterar\s+((?:ped-[a-z0-9-]+|dc-\d{6}))\s+(cod-[a-z0-9-]+)\s+([\s\S]+)$/i);
       if (changeMatch) {
         const data = await storeInternal(`/api/public/orders/${encodeURIComponent(changeMatch[1])}/change-requests`, { method:'POST', body:JSON.stringify({ number:changeMatch[1], code:changeMatch[2], phone, notes:changeMatch[3], reason:changeMatch[3] }) });
         return message.reply(`✏️ Solicitação registrada para ${changeMatch[1].toUpperCase()}.\n\nA equipe vai verificar se ainda é possível alterar o pedido e informará qualquer diferença de valor.`);
       }
-      if (body === '4' || body.includes('alterar pedido') || body.includes('acrescentar') || body.includes('editar pedido')) return message.reply('✏️ Envie: alterar PED-XXXXXX COD-XXXXXX explique o que deseja alterar. A equipe verificará o estágio, estoque e eventual diferença de valor.');
+      if (body === '4' || body.includes('alterar pedido') || body.includes('acrescentar') || body.includes('editar pedido')) return message.reply('✏️ Envie: alterar DC-000123 COD-XXXXXX explique o que deseja alterar. A equipe verificará o estágio, estoque e eventual diferença de valor.');
       if (body === '5' || body === 'atendente') {
         const data = await storeInternal('/api/internal/support/request', { method: 'POST', body: JSON.stringify({ phone, name: message._data?.notifyName || '' }) });
         if (!data.attendants?.length) return message.reply('👤 Recebi sua solicitação, mas nossa equipe de atendimento está offline no momento. Tente novamente em instantes.');
@@ -481,9 +481,10 @@ async function resetRegistration(message, phone) {
 function staffMenu(staff) {
   const lines = [`👋 Olá, ${staff.name}!`, '', '🔐 Funções disponíveis:'];
   if (staff.canSell) lines.push('🛍️ vender — gerar seu catálogo de vendas', '🍫 produtos — ver produtos e preço de repasse', '📊 minhas vendas — resumo das suas vendas', '💰 extrato — seu resultado');
-  if (staff.canPick) lines.push('📦 fila — pedidos para separar', '📦 separar PED-... — assumir separação', '✅ separado PED-... — finalizar separação');
-  if (staff.canDeliver) lines.push('🚚 entregas — pedidos disponíveis para entrega', '🚚 entregar PED-... — sair para entrega', '✅ entregue PED-... — concluir entrega');
-  if (staff.isAdmin || staff.canApproveCustomers) lines.push('👥 cadastros — aprovar ou rejeitar novos clientes', '✅ aprovar CAD-... — aprovar cadastro', '❌ rejeitar CAD-... — rejeitar cadastro');
+  if (staff.canPick) lines.push('📦 fila — pedidos para separar', '📦 separar DC-000123 — assumir separação', '✅ separado DC-000123 — finalizar separação');
+  if (staff.canDeliver) lines.push('🚚 entregas — pedidos disponíveis para entrega', '🚚 entregar DC-000123 — sair para entrega', '✅ entregue DC-000123 — concluir entrega');
+  if (staff.isAdmin || staff.canApproveCustomers || staff.canApproveOrders) lines.push('👥 cadastros — aprovar ou rejeitar novos clientes', '✅ aprovar CAD-... — aprovar cadastro', '❌ rejeitar CAD-... — rejeitar cadastro');
+  if (staff.isAdmin || staff.canApproveOrders || staff.canSell) lines.push('🧾 aprovar pedidos — listar pedidos aguardando aprovação', '✅ aprovar pedido DC-000123 — aprovar pedido pago');
   if (staff.canAttend) lines.push('💬 atendimentos — chamados aguardando', '👤 atender ATD-00001 — assumir atendimento', '✅ finalizar ATD-00001 — encerrar atendimento', '↩️ responder ATD-00001 texto — responder cliente');
   lines.push('', 'Digite ajuda a qualquer momento.');
   return lines.join('\n');
@@ -510,6 +511,19 @@ async function handleStaffMessage(message, staff, original, body, phone) {
     if (!(staff.isAdmin || staff.canApproveCustomers)) return message.reply('🚫 Você não possui permissão para aprovar cadastros.');
     const data = await storeInternal('/api/internal/customer-registrations/decision', {method:'POST',body:JSON.stringify({phone,registrationId:Number(approveMatch[1]),decision:'approved'})});
     return message.reply(`✅ Cadastro CAD-${Number(approveMatch[1])} aprovado para ${data.customer.preferredName}.`);
+  }
+  if (body === 'aprovar pedidos' || body === 'pedidos pendentes') {
+    if (!(staff.isAdmin || staff.canApproveOrders || staff.canSell)) return message.reply('🚫 Você não possui permissão para aprovar pedidos.');
+    const data = await storeInternal('/api/internal/staff/orders');
+    const pending = (data.orders || []).filter(o => o.status === 'pending').slice(0, 20);
+    if (!pending.length) return message.reply('📦 Não há pedidos pendentes para aprovação.');
+    return message.reply(pending.map(o => `🧾 ${o.orderNumber || o.order_number}\nCliente: ${o.customerName || o.customer_name}\nTotal: R$ ${Number(o.total || 0).toFixed(2).replace('.', ',')}\nPagamento: ${o.paymentStatus || o.payment_status}\nUse: aprovar pedido ${o.orderNumber || o.order_number}`).join('\n\n'));
+  }
+  const approveOrder = body.match(/^aprovar pedido\s+((?:ped-[a-z0-9-]+|dc-\d{6}))$/i);
+  if (approveOrder) {
+    if (!(staff.isAdmin || staff.canApproveOrders || staff.canSell)) return message.reply('🚫 Você não possui permissão para aprovar pedidos.');
+    const data = await storeInternal(`/api/internal/staff/orders/${encodeURIComponent(approveOrder[1])}/approve`, { method:'POST', body:JSON.stringify({phone}) });
+    return message.reply(`✅ Pedido ${data.order.orderNumber || approveOrder[1].toUpperCase()} aprovado e enviado para separação.`);
   }
   const rejectMatch = body.match(/^rejeitar\s+cad-(\d+)$/i);
   if (rejectMatch) {
@@ -566,7 +580,7 @@ async function handleStaffMessage(message, staff, original, body, phone) {
     const lines = rows.map(o => `📦 ${o.orderNumber}\n👤 ${o.customerName}\n📍 ${o.address || 'sem endereço'}${o.city ? `, ${o.city}/${o.state}` : ''}\nStatus: ${o.pickingStatus} / ${o.deliveryStatus}`);
     return message.reply(lines.join('\n\n'));
   }
-  const action = body.match(/^(assumir|separar|separado|entregar|entregue)\s+(ped-[a-z0-9-]+)/i);
+  const action = body.match(/^(assumir|separar|separado|entregar|entregue)\s+((?:ped-[a-z0-9-]+|dc-\d{6}))/i);
   if (action) {
     const data = await storeInternal(`/api/internal/staff/orders?phone=${encodeURIComponent(phone)}`);
     const found = data.orders.find(item => item.orderNumber?.toLowerCase() === action[2].toLowerCase());
@@ -613,26 +627,18 @@ async function pollNotifications() {
 }
 function formatNotification(item) {
   const p=item.payload||{};
-  if (item.type==='order_created') return `🛒 Pedido recebido!\n${p.orderNumber}\nTotal: R$ ${Number(p.total||0).toFixed(2).replace('.',',')}\n\nAguarde nossa confirmação.`;
+  if (item.type==='order_created') return `🛒 Pedido recebido!\n${p.orderNumber}\nTotal: R$ ${Number(p.total||0).toFixed(2).replace('.',',')}\n\nAguarde nossa confirmação.\n\nPagamento: R$ ${Number(p.total||0).toFixed(2).replace('.', ',')} até ${p.paymentDueDate ? formatDate(p.paymentDueDate) : 'hoje'}. Se já pagou, desconsidere este aviso.`;
   if (item.type==='campaign_order_created') return `🍫 Pedido de campanha recebido!\n\nCampanha: ${p.campaignName || 'Campanha'}\n📦 Pedido: ${p.orderNumber}\n🔐 Código de acesso: ${p.accessCode}\n💰 Total: R$ ${(Number(p.totalCents||0)/100).toFixed(2).replace('.',',')}\n\n📲 Para acompanhar ou alterar seu pedido, abra o link abaixo e vá em “Consultar meu pedido”. Informe o número do pedido, seu WhatsApp e o código de acesso.\n${p.campaignUrl ? `\n🔗 ${p.campaignUrl}\n` : ''}\nGuarde esse código: ele também será usado para alterações permitidas no pedido.`;
   if (item.type==='new_sale') return `🛒 Nova venda!\nPedido: ${p.orderNumber}\nCliente: ${p.customerName}\nTotal: R$ ${Number(p.total||0).toFixed(2).replace('.',',')}`;
   if (item.type==='new_picking') return `📦 Novo pedido para separação\n${p.orderNumber}\nCliente: ${p.customerName}\n\nUse: separar ${p.orderNumber}`;
   if (item.type==='new_delivery') return `🚚 NOVA ENTREGA DISPONÍVEL\n\nPedido: ${p.orderNumber}\nCliente: ${p.customerName || 'não informado'}\nTelefone: ${p.customerPhone || 'não informado'}\n\nEndereço:\n${p.address || 'não informado'}${p.city ? `\n${p.city}/${p.state || ''} ${p.postalCode || ''}` : ''}\n\nObservação: ${p.shippingNotes || 'nenhuma'}\nValor: R$ ${Number(p.total || 0).toFixed(2).replace('.', ',')}\nPagamento: ${p.paymentStatus || 'a confirmar'}\n\nUse: entregar ${p.orderNumber}`;
   if (item.type==='new_support') return `💬 NOVO ATENDIMENTO\nATD-${String(p.ticketId).padStart(5,'0')}\nCliente: ${p.customerName || 'não informado'}\nTelefone: ${p.customerPhone}\n${p.orderNumber ? `Pedido: ${p.orderNumber}\n` : ''}\nUse: atender ATD-${String(p.ticketId).padStart(5,'0')}`;
   if (item.type==='order_status') return `📦 ${p.orderNumber}\n🚚 ${p.label || p.status}`;
-  if (item.type==='order_ready') return `✅ Pedido pronto\n${p.orderNumber}\n\nSeu pedido está pronto para a próxima etapa.`;
-  if (item.type==='order_delayed') return `⏱️ Atualização de prazo\n${p.orderNumber}\n\nSeu pedido sofreu um atraso. Nossa equipe está acompanhando e enviará a nova previsão assim que confirmada.`;
-  if (item.type==='delivery_nearby') return `🚚 Entrega próxima\n${p.orderNumber}\n\nO entregador está se aproximando. Mantenha o telefone disponível.`;
-  if (item.type==='delivery_incident') return `⚠️ Ocorrência na entrega\n${p.orderNumber}\n\nNossa equipe foi avisada e entrará em contato para orientar a solução.`;
-  if (item.type==='picking_issue') return `⚠️ Ajuste na separação\n${p.orderNumber}\n\nUm item precisa ser confirmado pela equipe. O atendimento falará com você pelo número oficial.`;
   if (item.type==='payment_paid') return `💰 Pagamento confirmado\nPedido: ${p.orderNumber}\nValor: R$ ${Number(p.total || 0).toFixed(2).replace('.', ',')}`;
+  if (item.type==='payment_reminder') return `⏰ LEMBRETE DE PAGAMENTO\nPedido: ${p.orderNumber}\nValor: R$ ${Number(p.total || 0).toFixed(2).replace('.', ',')}\nVencimento: ${p.dueDate ? formatDate(p.dueDate) : 'hoje'}\n\n${p.message || 'Se já pagou, desconsidere esta mensagem.'}`;
+  if (item.type==='order_confirmed') return `✅ Pedido confirmado!\nPedido: ${p.orderNumber}\nTotal: R$ ${Number(p.total || 0).toFixed(2).replace('.', ',')}\n\nAgora seu pedido seguirá para separação.`;
+  if (item.type==='payment_refunded') return `💸 Estorno registrado\nPedido: ${p.orderNumber}\nValor: R$ ${Number(p.amount || 0).toFixed(2).replace('.', ',')}`;
   if (item.type==='payment_due') return `💰 PAGAMENTO PENDENTE\nPedido: ${p.orderNumber}\nValor: R$ ${Number(p.total || 0).toFixed(2).replace('.', ',')}${p.dueDate ? `\nVencimento: ${formatDate(p.dueDate)}` : ''}\n\nSe você já pagou, desconsidere esta mensagem e aguarde a confirmação da equipe.`;
-  if (item.type==='payment_difference_due') return `💰 DIFERENÇA A PAGAR\nPedido: ${p.orderNumber}\nValor adicional: R$ ${Number(p.amount || 0).toFixed(2).replace('.', ',')}${p.dueDate ? `\nVencimento: ${formatDate(p.dueDate)}` : ''}\n\nSe você já pagou, desconsidere esta mensagem e envie o comprovante pelo atendimento.`;
-  if (item.type==='payment_failed') return `⚠️ Pagamento não confirmado\nPedido: ${p.orderNumber}\nValor: R$ ${Number(p.total || 0).toFixed(2).replace('.', ',')}\n\nEntre no atendimento para regularizar o pedido.`;
-  if (item.type==='payment_refunded') return `💸 Estorno registrado\nPedido: ${p.orderNumber}\nValor: R$ ${Number(p.total || 0).toFixed(2).replace('.', ',')}`;
-  if (item.type==='payment_difference_paid') return `✅ Diferença de pagamento confirmada\nPedido: ${p.orderNumber}\nValor adicional: R$ ${Number(p.amount || 0).toFixed(2).replace('.', ',')}`;
-  if (item.type==='refund_pending') return `💸 Estorno pendente\nPedido: ${p.orderNumber}\nValor: R$ ${Number(p.amount || 0).toFixed(2).replace('.', ',')}\n\nNossa equipe concluirá o estorno e avisará por aqui.`;
-  if (item.type==='refund_completed') return `✅ Estorno concluído\nPedido: ${p.orderNumber}\nValor: R$ ${Number(p.amount || 0).toFixed(2).replace('.', ',')}`;
   if (item.type==='order_change_received') return `✏️ Solicitação de alteração recebida\nPedido: ${p.orderNumber}\n\nNossa equipe vai verificar estoque, etapa e eventual diferença de valor.`;
   if (item.type==='order_change_approved') return `✅ Alteração aprovada\nPedido: ${p.orderNumber}\nNovo total: R$ ${Number(p.total || 0).toFixed(2).replace('.', ',')}`;
   if (item.type==='order_change_rejected') return `❌ Alteração não aprovada\nPedido: ${p.orderNumber}\n\nEntre em contato pelo menu Atendente para saber o motivo.`;

@@ -1,6 +1,6 @@
-# Doce Casa Store — V6.5 Operação Profissional
+# Doce Casa Store — V6.3 Operação Completa
 
-Esta versão fecha o fluxo operacional da loja: cliente, vendedor, pagamento, produção, separação, entrega, atendimento, financeiro, auditoria, rastreamento, alteração controlada e recuperação operacional.
+Esta versão fecha o fluxo operacional da loja: cliente, vendedor, pagamento, produção, separação, entrega, atendimento, financeiro e auditoria.
 
 ## Regras principais
 
@@ -16,10 +16,7 @@ Esta versão fecha o fluxo operacional da loja: cliente, vendedor, pagamento, pr
 - Grupos do WhatsApp são ignorados pelo robô.
 - Permissões são verificadas no backend, não somente no menu.
 - O WhatsApp do administrador não recebe comandos administrativos por ser administrador; ele segue as permissões cadastradas para aquele número.
-- O cliente recebe notificações de status, pagamento, vencimento, alteração, separação, saída para entrega e conclusão, sem expor dados desnecessários do entregador.
-- O cliente acompanha o pedido pelo código e telefone no WhatsApp; a resposta inclui status atual, histórico, pagamento e próxima etapa.
-- Lembretes de pagamento verificam o status antes do envio e não são enviados para pedidos já pagos.
-- O atendimento permanece no número oficial da Doce Casa; funcionários assumem tickets internamente e nunca recebem o cliente em número pessoal.
+- O cliente recebe notificações simples de status, incluindo `🚚 Saiu para entrega`, sem expor dados desnecessários do entregador.
 - A equipe recebe notificações operacionais pela fila interna do WhatsApp.
 - Toda ação operacional importante pode ser registrada em `audit_logs`.
 
@@ -75,11 +72,12 @@ Financeiro, quando permitido:
 
 Recebe somente:
 
-1. Produtos
-2. Campanhas
-3. Status
-4. Alterar pedido
-5. Atendente
+1. Comprar
+2. Produtos
+3. Campanhas
+4. Status
+5. Alterar pedido
+6. Atendente
 
 ## Venda vinculada ao vendedor
 
@@ -102,9 +100,9 @@ Fluxo recomendado:
 
 ## Atendimento
 
-O cliente envia `5` e o servidor abre um ticket. Todos os funcionários com permissão **Atendimento** recebem uma notificação. O primeiro autorizado a executar `atender ATD-00001` assume o chamado. O ticket fica associado ao cliente e ao pedido quando houver pedido.
+O cliente envia `6` e o servidor abre um ticket. Todos os funcionários com permissão **Atendimento** recebem uma notificação. O primeiro autorizado a executar `atender ATD-00001` assume o chamado. O ticket fica associado ao cliente e ao pedido quando houver pedido.
 
-As mensagens são persistidas em `support_messages`. O atendente usa `responder ATD-00001 texto`; a resposta sai novamente pelo número oficial da Doce Casa. O painel administrativo possui fila, mensagens e histórico de auditoria.
+O painel administrativo possui fila de atendimentos e histórico de auditoria.
 
 ## Auditoria
 
@@ -161,12 +159,6 @@ Também foram acrescentadas/ajustadas rotinas administrativas de edição para e
 - Rate limit básico no login e segredos obrigatórios.
 - Notificações de campanha incluem o link de acesso quando disponível.
 
-## V6.5 — operação profissional
-
-A V6.5 adiciona histórico de pedidos normais, solicitações controladas de alteração, pagamentos com vencimento, lembretes idempotentes, mensagens persistentes de atendimento, dados completos para entregadores, notificações idempotentes e migração compatível com bancos existentes. A branch de desenvolvimento deve ser testada em ambiente isolado antes da promoção para produção.
-
-Critérios obrigatórios antes da implantação: testes de regressão, backup, restauração, HTTPS, PM2/systemd isolado, reconexão do WhatsApp e homologação do fluxo cliente → pedido → pagamento → separação → entrega.
-
 ## V6.3 — auditoria e produção
 
 Esta versão consolida as correções de campanha, estoque, financeiro, edição, entrega, segurança e notificações. A campanha permanece independente do catálogo normal. O banco e o histórico devem ser preservados durante a implantação.
@@ -174,18 +166,6 @@ Esta versão consolida as correções de campanha, estoque, financeiro, edição
 Antes de produção, execute `npm run audit` e os testes de homologação descritos em `TESTES.md`.
 
 
-## V6.5.1 — fechamento financeiro e operacional
+## V6.5.2 — rodada completa para homologação
 
-A revisão V6.5.1 preserva os pagamentos originais e registra alterações de pedido em `order_payment_adjustments`. Quando uma alteração aprovada aumenta o total de um pedido já pago, o pedido passa a `partial` e é criada uma diferença pendente com vencimento e notificação. Quando uma alteração reduz um pedido já pago, é criado um ajuste de estorno pendente; o histórico original não é sobrescrito.
-
-Falhas e estornos passam a registrar `failed_at` e `refunded_at`. O administrador pode liquidar um ajuste por `PATCH /api/admin/orders/:id/payment-adjustments/:adjustmentId`, usando `paid` para diferenças e `refunded` para estornos. O cliente recebe mensagens pelo número oficial da loja e consegue consultar `paymentAdjustments` no rastreamento.
-
-Eventos operacionais podem ser registrados pelo administrador em `POST /api/admin/orders/:id/operational-event` com `ready`, `delayed`, `picking_issue`, `delivery_nearby` ou `delivery_incident`. Cada evento gera histórico, auditoria, notificação idempotente e mensagem específica no WhatsApp.
-
-A aplicação também envia headers de segurança padrão, incluindo proteção contra MIME sniffing, clickjacking, política de referência, permissões de navegador e Content Security Policy. Requisições administrativas que usam cookie são rejeitadas quando a origem ou o referer não correspondem ao host atual. HTTPS reverso continua obrigatório em produção.
-
-A suíte local `node scripts/test-v65.js` cobre schema, autenticação, custo das faixas, link único, pedido, timeline, pagamento, alteração, diferença financeira, liquidação de ajuste, eventos operacionais e proteção de origem. WhatsApp real, QR, reconexão, reboot, backup/restauração e Nginx/HTTPS continuam exigindo homologação no ambiente controlado do servidor antes do deploy.
-
-## Política de implantação
-
-A `main` permanece como rollback. A branch V6.5 deve ser instalada somente após backup verificável do SQLite, uploads e sessão WhatsApp; validação do `.env`; confirmação de permissões do usuário `doceapp`; teste de health check; validação dos dois processos PM2; e registro do commit exato instalado. Não apagar `data/whatsapp-auth` para tentar corrigir uma falha sem preservar primeiro uma cópia da sessão.
+Esta entrega consolida a base V6.5 enviada e adiciona numeração `DC-000001`, pagamento normal no mesmo dia, aprovação pós-pagamento, alteração estruturada com ajuste de estoque/financeiro, histórico, eventos operacionais, tentativas de entrega, endereços múltiplos, lembretes idempotentes e reforço de headers de segurança. Consulte `V6.5.2-COMPLETA.md` e execute `npm run test:v65-complete` antes da homologação.
