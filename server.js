@@ -1481,7 +1481,7 @@ app.post('/api/public/orders', requireCatalogAccess, (req, res) => {
         shipping_postal_code, shipping_address, shipping_city, shipping_state, shipping_recipient_name,
         shipping_notes, payment_method, payment_status, status,
         subtotal_cents, shipping_cents, total_cents, source, notes, salesperson_id, campaign_id, payment_due_date
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 'pending', ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       orderNumber,
       String(customer.name).trim(),
@@ -1784,13 +1784,24 @@ app.patch('/api/admin/orders/:id', requireAdmin, (req, res) => {
   } catch (error) {
     return res.status(409).json({ error: error.message });
   }
-  const row = db.prepare('SELECT * FROM orders WHERE id = ?').get(id);
-  recordOrderHistory(id, 'status_changed', { status: current.status, paymentStatus: current.payment_status }, { status: nextStatus, paymentStatus: nextPayment }, { type: 'admin', id: req.admin?.sub, name: req.admin?.email }, String(req.body.reason || ''));
+  let row = db.prepare('SELECT * FROM orders WHERE id = ?').get(id);
+  const notesChanged = req.body.notes !== undefined && String(req.body.notes) !== String(current.notes || '');
+  const dueDateChanged = requestedDueDate !== current.payment_due_date;
+  const statusChanged = nextStatus !== current.status;
+  const paymentChanged = nextPayment !== current.payment_status;
+  if (statusChanged || paymentChanged || dueDateChanged || notesChanged) {
+    recordOrderHistory(id, 'status_changed', { status: current.status, paymentStatus: current.payment_status, paymentDueDate: current.payment_due_date, notes: current.notes }, { status: nextStatus, paymentStatus: nextPayment, paymentDueDate: requestedDueDate || null, notes: req.body.notes === undefined ? current.notes : String(req.body.notes) }, { type: 'admin', id: req.admin?.sub, name: req.admin?.email }, String(req.body.reason || ''));
+  }
   if (nextPayment !== current.payment_status || requestedDueDate !== current.payment_due_date) {
     db.prepare(`UPDATE orders SET payment_paid_at = ${nextPayment === 'paid' ? 'COALESCE(payment_paid_at,CURRENT_TIMESTAMP)' : 'NULL'}, payment_reminder_sent_at = NULL WHERE id = ?`).run(id);
-    db.prepare('INSERT OR IGNORE INTO order_payments (order_id, amount_cents, method, status, due_date) VALUES (?, ?, ?, ?, ?)').run(id, row.total_cents, row.payment_method, nextPayment, requestedDueDate || null);
-    db.prepare('UPDATE order_payments SET status = ?, due_date = ?, paid_at = CASE WHEN ? = \'paid\' THEN COALESCE(paid_at,CURRENT_TIMESTAMP) ELSE paid_at END, updated_at = CURRENT_TIMESTAMP WHERE order_id = ? AND status NOT IN (\'refunded\')').run(nextPayment, requestedDueDate || null, nextPayment, id);
+    const activePayment = db.prepare("SELECT id FROM order_payments WHERE order_id = ? AND status != 'refunded' ORDER BY id DESC LIMIT 1").get(id);
+    if (activePayment) {
+      db.prepare('UPDATE order_payments SET status = ?, due_date = ?, paid_at = CASE WHEN ? = \'paid\' THEN COALESCE(paid_at,CURRENT_TIMESTAMP) ELSE paid_at END, updated_at = CURRENT_TIMESTAMP WHERE id = ?').run(nextPayment, requestedDueDate || null, nextPayment, activePayment.id);
+    } else {
+      db.prepare('INSERT INTO order_payments (order_id, amount_cents, method, status, due_date, paid_at) VALUES (?, ?, ?, ?, ?, CASE WHEN ? = \'paid\' THEN CURRENT_TIMESTAMP ELSE NULL END)').run(id, row.total_cents, row.payment_method, nextPayment, requestedDueDate || null, nextPayment);
+    }
   }
+  row = db.prepare('SELECT * FROM orders WHERE id = ?').get(id);
   logAudit('admin', req.admin?.sub, req.admin?.email, 'order_status_changed', 'order', id, { status: nextStatus, paymentStatus: nextPayment });
   const statusMessages = { confirmed: 'confirmado', preparing: 'em preparo', shipped: 'saiu para entrega', delivered: 'entregue', cancelled: 'cancelado' };
   if (statusMessages[nextStatus]) queueNotification(row.customer_phone, 'order_status', { orderNumber: row.order_number, status: nextStatus, label: statusMessages[nextStatus] });
@@ -1856,8 +1867,12 @@ app.post('/api/admin/orders/:id/payment', requireAdmin, (req, res) => {
   const before = { status: order.payment_status, dueDate: order.payment_due_date, paidAt: order.payment_paid_at };
   db.transaction(() => {
     db.prepare('UPDATE orders SET payment_status=?, payment_due_date=?, payment_paid_at=CASE WHEN ?=\'paid\' THEN COALESCE(payment_paid_at,CURRENT_TIMESTAMP) ELSE payment_paid_at END, payment_reminder_sent_at=NULL, updated_at=CURRENT_TIMESTAMP WHERE id=?').run(status, dueDate || null, status, id);
-    db.prepare('INSERT OR IGNORE INTO order_payments (order_id, amount_cents, method, status, due_date) VALUES (?, ?, ?, ?, ?)').run(id, order.total_cents, order.payment_method, status, dueDate || null);
-    db.prepare('UPDATE order_payments SET status=?, due_date=?, paid_at=CASE WHEN ?=\'paid\' THEN COALESCE(paid_at,CURRENT_TIMESTAMP) ELSE paid_at END, updated_at=CURRENT_TIMESTAMP WHERE order_id=? AND status NOT IN (\'refunded\')').run(status, dueDate || null, status, id);
+    const activePayment = db.prepare("SELECT id FROM order_payments WHERE order_id = ? AND status != 'refunded' ORDER BY id DESC LIMIT 1").get(id);
+    if (activePayment) {
+      db.prepare('UPDATE order_payments SET status=?, due_date=?, paid_at=CASE WHEN ?=\'paid\' THEN COALESCE(paid_at,CURRENT_TIMESTAMP) ELSE paid_at END, updated_at=CURRENT_TIMESTAMP WHERE id=?').run(status, dueDate || null, status, activePayment.id);
+    } else {
+      db.prepare('INSERT INTO order_payments (order_id, amount_cents, method, status, due_date, paid_at) VALUES (?, ?, ?, ?, ?, CASE WHEN ?=\'paid\' THEN CURRENT_TIMESTAMP ELSE NULL END)').run(id, order.total_cents, order.payment_method, status, dueDate || null, status);
+    }
   })();
   recordOrderHistory(id, 'payment_updated', before, { status, dueDate }, { type:'admin', id:req.admin?.sub, name:req.admin?.email }, String(req.body?.notes || ''));
   if (status === 'paid' && order.payment_status !== 'paid') queueNotification(order.customer_phone, 'payment_paid', { orderNumber: order.order_number, total: money(order.total_cents) }, `order:${id}:payment:paid`);
