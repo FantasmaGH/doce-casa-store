@@ -25,3 +25,5 @@ node_modules/
 *.bak
 *.bak-*
 .DS_Store
+
+data-homolog/

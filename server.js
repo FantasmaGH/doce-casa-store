@@ -639,8 +639,59 @@ function payableView(row) {
   return { ...row, amount: money(row.amount_cents), daysUntilDue, overdue: row.status === 'pending' && daysUntilDue < 0, paid: row.status === 'paid' };
 }
 
+function orderPaymentSummary(orderId, totalCents) {
+  const rows = db.prepare(`
+    SELECT
+      COALESCE(SUM(CASE WHEN status='paid' THEN amount_cents ELSE 0 END),0) AS paidCents,
+      COALESCE(SUM(CASE WHEN status='pending' THEN amount_cents ELSE 0 END),0) AS pendingCents,
+      COALESCE(SUM(CASE WHEN status='failed' THEN amount_cents ELSE 0 END),0) AS failedCents,
+      COALESCE(SUM(CASE WHEN status='refunded' THEN amount_cents ELSE 0 END),0) AS refundedCents
+    FROM order_payments
+    WHERE order_id=?
+  `).get(orderId);
+
+  const total = Math.max(0, Number(totalCents) || 0);
+  const paidCents = Math.max(0, Number(rows?.paidCents) || 0);
+  const pendingCents = Math.max(0, Number(rows?.pendingCents) || 0);
+  const failedCents = Math.max(0, Number(rows?.failedCents) || 0);
+  const refundedCents = Math.max(0, Number(rows?.refundedCents) || 0);
+
+  /*
+   * Um estorno liquida uma parte do valor originalmente recebido; ele não
+   * reabre aquela parte como saldo a cobrar. Por isso, tanto valores ainda
+   * pagos quanto valores explicitamente estornados compõem o total resolvido
+   * do pedido. O valor que ainda pode ser estornado é somente o que continua
+   * com status paid no ledger.
+   */
+  const settledCents = paidCents + refundedCents;
+  const isRefunded = refundedCents >= total && paidCents === 0 && total > 0;
+  const remainingCents = Math.max(0, total - settledCents);
+
+  let status = 'pending';
+  if (isRefunded) {
+    status = 'refunded';
+  } else if (settledCents >= total && total > 0) {
+    status = 'paid';
+  } else if (paidCents > 0) {
+    status = 'partial';
+  }
+
+  return {
+    totalCents: total,
+    paidCents,
+    pendingCents,
+    failedCents,
+    refundedCents,
+    settledCents,
+    refundableCents: paidCents,
+    remainingCents,
+    status
+  };
+}
+
 function orderView(order) {
   if (!order) return null;
+  const paymentSummary = orderPaymentSummary(order.id, order.total_cents);
   const items = db.prepare(`
     SELECT id, product_id AS productId, name_snapshot AS name, quantity,
            unit_price_cents AS unitPriceCents, unit_vendor_price_cents AS unitVendorPriceCents, unit_cost_cents AS unitCostCents
@@ -660,7 +711,13 @@ function orderView(order) {
     orderNumber: order.order_number,
     customerName: order.customer_name,
     customerPhone: order.customer_phone,
-    paymentStatus: order.payment_status,
+    paymentStatus: paymentSummary.status,
+    paidCents: paymentSummary.paidCents,
+    paid: money(paymentSummary.paidCents),
+    remainingCents: paymentSummary.remainingCents,
+    remaining: money(paymentSummary.remainingCents),
+    pendingPaymentCents: paymentSummary.pendingCents,
+    refundedPaymentCents: paymentSummary.refundedCents,
     status: order.status,
     subtotal: money(order.subtotal_cents),
     shipping: money(order.shipping_cents),
@@ -1100,7 +1157,7 @@ app.post('/api/internal/customer-registrations/decision', requireWhatsAppInterna
 });
 
 app.get('/api/admin/catalog-links', requireAdmin, (_req, res) => {
-  const rows = db.prepare('SELECT l.id, l.expires_at AS expiresAt, l.used_at AS usedAt, l.created_at AS createdAt, s.name AS salespersonName FROM public_links l LEFT JOIN staff_users s ON s.id=l.requested_by_staff_id ORDER BY id DESC LIMIT 100').all();
+  const rows = db.prepare('SELECT l.id, l.expires_at AS expiresAt, l.used_at AS usedAt, l.created_at AS createdAt, s.name AS salespersonName FROM public_links l LEFT JOIN staff_users s ON s.id=l.requested_by_staff_id ORDER BY l.id DESC LIMIT 100').all();
   res.json({ links: rows.map(row => ({ ...row, status: row.usedAt ? (new Date(row.expiresAt) > new Date() ? 'used' : 'expired') : (new Date(row.expiresAt) > new Date() ? 'available' : 'expired') })) });
 });
 
@@ -1277,7 +1334,36 @@ function paymentTimeline(orderId) {
 }
 function publicOrderView(order) {
   const view = orderView(order);
-  return { orderNumber: order.order_number, accessCode: db.prepare('SELECT code FROM order_access_codes WHERE order_id=?').get(order.id)?.code, customerName: order.customer_name, status: order.status, pickingStatus: order.picking_status, deliveryStatus: order.delivery_status, paymentStatus: order.payment_status, paymentDueDate: order.payment_due_date || null, paymentPaidAt: order.payment_paid_at || null, paymentAmountDue: order.payment_status === 'paid' ? 0 : money(order.total_cents), recipientName: order.shipping_recipient_name || null, total: money(order.total_cents), createdAt: order.created_at, updatedAt: order.updated_at, nextStep: order.status === 'pending' ? 'Aguardando confirmação' : order.status === 'confirmed' ? 'Aguardando separação' : order.status === 'preparing' ? 'Separação em andamento' : order.status === 'shipped' ? 'Em entrega' : order.status === 'delivered' ? 'Pedido concluído' : order.status === 'cancelled' ? 'Pedido cancelado' : order.status, items: view.items.map(item => ({ name: item.name, quantity: item.quantity })), timeline: orderTimeline(order.id), payments: paymentTimeline(order.id) };
+  return {
+    orderNumber: order.order_number,
+    accessCode: db.prepare('SELECT code FROM order_access_codes WHERE order_id=?').get(order.id)?.code,
+    customerName: order.customer_name,
+    status: order.status,
+    pickingStatus: order.picking_status,
+    deliveryStatus: order.delivery_status,
+    paymentStatus: view.paymentStatus,
+    paymentDueDate: order.payment_due_date || null,
+    paymentPaidAt: order.payment_paid_at || null,
+    paymentAmountDue: view.remaining,
+    paymentAmountDueCents: view.remainingCents,
+    paidAmount: view.paid,
+    paidAmountCents: view.paidCents,
+    recipientName: order.shipping_recipient_name || null,
+    total: money(order.total_cents),
+    totalCents: Number(order.total_cents),
+    createdAt: order.created_at,
+    updatedAt: order.updated_at,
+    nextStep: order.status === 'pending' ? 'Aguardando confirmação'
+      : order.status === 'confirmed' ? 'Aguardando separação'
+      : order.status === 'preparing' ? 'Separação em andamento'
+      : order.status === 'shipped' ? 'Em entrega'
+      : order.status === 'delivered' ? 'Pedido concluído'
+      : order.status === 'cancelled' ? 'Pedido cancelado'
+      : order.status,
+    items: view.items.map(item => ({ name: item.name, quantity: item.quantity })),
+    timeline: orderTimeline(order.id),
+    payments: paymentTimeline(order.id)
+  };
 }
 app.get('/api/public/order-status', (req, res) => {
   const order = findOrderByAccess(req.query.number, req.query.code, req.query.phone);
@@ -1321,16 +1407,17 @@ app.get('/api/admin/order-change-requests', requireAdmin, (_req, res) => {
   res.json({ requests: rows });
 });
 app.patch('/api/admin/order-change-requests/:id', requireAdmin, (req, res) => {
-  const request = db.prepare('SELECT r.*, o.* FROM order_change_requests r JOIN orders o ON o.id=r.order_id WHERE r.id=? AND r.status=\'pending\'').get(Number(req.params.id));
+  const changeRequestId = Number(req.params.id);
+  const request = db.prepare('SELECT r.*, o.* FROM order_change_requests r JOIN orders o ON o.id=r.order_id WHERE r.id=? AND r.status=\'pending\'').get(changeRequestId);
   if (!request) return res.status(404).json({ error: 'Solicitação não encontrada.' });
   const decision = String(req.body?.decision || '').toLowerCase();
   if (!['approved','rejected'].includes(decision)) return res.status(400).json({ error: 'Decisão inválida.' });
   const requested = JSON.parse(request.requested_json || '{}');
   if (decision === 'rejected') {
     const reason = String(req.body.reason || 'Alteração rejeitada');
-    db.prepare("UPDATE order_change_requests SET status='rejected', reviewed_by=?, reviewed_at=CURRENT_TIMESTAMP, reason=? WHERE id=?").run(req.admin?.sub || null, reason, request.id);
-    recordOrderHistory(request.order_id, 'change_rejected', { requestId: request.id }, { requestId: request.id, status: 'rejected' }, { type: 'admin', id: req.admin?.sub, name: req.admin?.email }, reason);
-    queueNotification(request.customer_phone, 'order_change_rejected', { orderNumber: request.order_number, reason }, `order:${request.order_id}:change:${request.id}:rejected`);
+    db.prepare("UPDATE order_change_requests SET status='rejected', reviewed_by=?, reviewed_at=CURRENT_TIMESTAMP, reason=? WHERE id=?").run(req.admin?.sub || null, reason, changeRequestId);
+    recordOrderHistory(request.order_id, 'change_rejected', { requestId: changeRequestId }, { requestId: changeRequestId, status: 'rejected' }, { type: 'admin', id: req.admin?.sub, name: req.admin?.email }, reason);
+    queueNotification(request.customer_phone, 'order_change_rejected', { orderNumber: request.order_number, reason }, `order:${request.order_id}:change:${changeRequestId}:rejected`);
     return res.json({ ok: true, status: 'rejected' });
   }
 
@@ -1355,7 +1442,10 @@ app.patch('/api/admin/order-change-requests/:id', requireAdmin, (req, res) => {
   }
   const subtotal = normalized.reduce((sum, item) => sum + Math.round(item.quantity * item.pricing.priceCents), 0);
   const shipping = requested.shipping || {};
-  const shippingCents = requested.shipping ? Math.max(0, cents(shipping.shippingCents || 0)) : Number(request.shipping_cents || 0);
+  const shippingInput = requested.shipping?.shippingCents ?? 0;
+  const shippingCents = typeof shippingInput === 'number' && Number.isInteger(shippingInput)
+    ? Math.max(0, shippingInput)
+    : Math.max(0, cents(shippingInput));
   const total = subtotal + shippingCents;
   const delta = total - Number(request.total_cents);
 
@@ -1388,33 +1478,129 @@ app.patch('/api/admin/order-change-requests/:id', requireAdmin, (req, res) => {
     const insert = db.prepare('INSERT INTO order_items (order_id,product_id,name_snapshot,quantity,unit_price_cents,unit_vendor_price_cents,unit_cost_cents) VALUES (?,?,?,?,?,?,?)');
     normalized.forEach(item=>insert.run(request.order_id,item.product.id,item.product.name,item.quantity,item.pricing.priceCents,item.pricing.vendorPriceCents,item.pricing.costCents));
 
-    let nextPaymentStatus = request.payment_status;
+    /*
+     * Reconcilia o ledger de pagamentos após a alteração do pedido.
+     *
+     * Regras:
+     * - pagamentos já pagos nunca são alterados;
+     * - o saldo devido é sempre calculado a partir do novo total
+     *   menos o total efetivamente pago;
+     * - somente parcelas pending podem ser ajustadas;
+     * - se faltar uma parcela pending para representar o saldo,
+     *   ela é criada;
+     * - se houver pending excedente, somente o excedente pending
+     *   é reduzido/removido;
+     * - não altera pagamentos paid, failed ou refunded.
+     */
+    const paidLedger = db.prepare(`
+      SELECT COALESCE(SUM(amount_cents), 0) AS paidCents
+      FROM order_payments
+      WHERE order_id=? AND status='paid'
+    `).get(request.order_id);
+
+    const paidCentsAfterChange = Math.max(0, Number(paidLedger?.paidCents) || 0);
+    const remainingCentsAfterChange = Math.max(0, total - paidCentsAfterChange);
+
+    const reconcilePendingPayments = () => {
+      const pendingRows = db.prepare(`
+        SELECT id, amount_cents, method, due_date, reference, notes
+        FROM order_payments
+        WHERE order_id=? AND status='pending' AND amount_cents > 0
+        ORDER BY id ASC
+      `).all(request.order_id);
+
+      let pendingTarget = remainingCentsAfterChange;
+
+      for (const pending of pendingRows) {
+        if (pendingTarget <= 0) {
+          /*
+           * Esta parcela pending deixou de existir após a
+           * recalculação do pedido. Ela não falhou; portanto,
+           * não deve ser transformada em failed nem permanecer
+           * no ledger com valor zero.
+           *
+           * Pagamentos paid/failed/refunded nunca são tocados.
+           */
+          db.prepare(`
+            DELETE FROM order_payments
+            WHERE id=? AND status='pending'
+          `).run(pending.id);
+          continue;
+        }
+
+        const keepCents = Math.min(
+          pendingTarget,
+          Math.max(0, Number(pending.amount_cents) || 0)
+        );
+
+        if (keepCents !== Number(pending.amount_cents)) {
+          db.prepare(`
+            UPDATE order_payments
+            SET amount_cents=?,
+                updated_at=CURRENT_TIMESTAMP
+            WHERE id=? AND status='pending'
+          `).run(keepCents, pending.id);
+        }
+
+        pendingTarget -= keepCents;
+      }
+
+      if (pendingTarget > 0) {
+        db.prepare(`
+          INSERT INTO order_payments
+            (order_id, amount_cents, method, status, due_date, reference, notes)
+          VALUES
+            (?, ?, ?, 'pending', ?, ?, ?)
+        `).run(
+          request.order_id,
+          pendingTarget,
+          request.payment_method || 'a_combinar',
+          new Date().toISOString().slice(0, 10),
+          `order:${request.order_id}:change:${changeRequestId}:pending`,
+          'Saldo pendente gerado após alteração do pedido.'
+        );
+      }
+    };
+
+    let nextPaymentStatus = remainingCentsAfterChange > 0 ? 'pending' : 'paid';
     let refundPending = 0;
     if (delta > 0) {
       nextPaymentStatus = 'pending';
       db.prepare('UPDATE orders SET subtotal_cents=?,shipping_cents=?,total_cents=?,payment_status=?,payment_due_date=?,payment_paid_at=NULL,payment_reminder_sent_at=NULL,shipping_address=COALESCE(?,shipping_address),shipping_city=COALESCE(?,shipping_city),shipping_state=COALESCE(?,shipping_state),shipping_postal_code=COALESCE(?,shipping_postal_code),shipping_notes=COALESCE(?,shipping_notes),shipping_recipient_name=COALESCE(?,shipping_recipient_name),notes=COALESCE(?,notes),updated_at=CURRENT_TIMESTAMP WHERE id=?')
         .run(subtotal,shippingCents,total,nextPaymentStatus,new Date().toISOString().slice(0,10),shipping.address||null,shipping.city||null,shipping.state||null,shipping.postalCode||null,shipping.notes||null,shipping.recipientName||null,requested.notes,request.order_id);
-      recordPaymentAdjustment(request.order_id,'balance_due',delta,'Aumento de total após alteração',{type:'admin',id:req.admin?.sub,name:req.admin?.email},`order:${request.order_id}:change:${request.id}:balance`);
+      reconcilePendingPayments();
+      recordPaymentAdjustment(request.order_id,'balance_due',delta,'Aumento de total após alteração',{type:'admin',id:req.admin?.sub,name:req.admin?.email},`order:${request.order_id}:change:${changeRequestId}:balance`);
     } else if (delta < 0) {
-      if (request.payment_status === 'paid') {
-        refundPending = Math.abs(delta);
-        db.prepare('UPDATE orders SET subtotal_cents=?,shipping_cents=?,total_cents=?,shipping_address=COALESCE(?,shipping_address),shipping_city=COALESCE(?,shipping_city),shipping_state=COALESCE(?,shipping_state),shipping_postal_code=COALESCE(?,shipping_postal_code),shipping_notes=COALESCE(?,shipping_notes),shipping_recipient_name=COALESCE(?,shipping_recipient_name),notes=COALESCE(?,notes),updated_at=CURRENT_TIMESTAMP WHERE id=?').run(subtotal,shippingCents,total,shipping.address||null,shipping.city||null,shipping.state||null,shipping.postalCode||null,shipping.notes||null,shipping.recipientName||null,requested.notes,request.order_id);
-        recordPaymentAdjustment(request.order_id,'refund_pending',refundPending,'Redução de total em pedido já pago',{type:'admin',id:req.admin?.sub,name:req.admin?.email},`order:${request.order_id}:change:${request.id}:refund`);
+      const excessPaidCents = Math.max(0, paidCentsAfterChange - total);
+
+      db.prepare('UPDATE orders SET subtotal_cents=?,shipping_cents=?,total_cents=?,shipping_address=COALESCE(?,shipping_address),shipping_city=COALESCE(?,shipping_city),shipping_state=COALESCE(?,shipping_state),shipping_postal_code=COALESCE(?,shipping_postal_code),shipping_notes=COALESCE(?,shipping_notes),shipping_recipient_name=COALESCE(?,shipping_recipient_name),notes=COALESCE(?,notes),updated_at=CURRENT_TIMESTAMP WHERE id=?').run(subtotal,shippingCents,total,shipping.address||null,shipping.city||null,shipping.state||null,shipping.postalCode||null,shipping.notes||null,shipping.recipientName||null,requested.notes,request.order_id);
+
+      reconcilePendingPayments();
+
+      if (excessPaidCents > 0) {
+        refundPending = excessPaidCents;
+        recordPaymentAdjustment(request.order_id,'refund_pending',refundPending,'Redução de total com excesso de pagamento após alteração',{type:'admin',id:req.admin?.sub,name:req.admin?.email},`order:${request.order_id}:change:${changeRequestId}:refund`);
       } else {
-        db.prepare('UPDATE orders SET subtotal_cents=?,shipping_cents=?,total_cents=?,shipping_address=COALESCE(?,shipping_address),shipping_city=COALESCE(?,shipping_city),shipping_state=COALESCE(?,shipping_state),shipping_postal_code=COALESCE(?,shipping_postal_code),shipping_notes=COALESCE(?,shipping_notes),shipping_recipient_name=COALESCE(?,shipping_recipient_name),notes=COALESCE(?,notes),updated_at=CURRENT_TIMESTAMP WHERE id=?').run(subtotal,shippingCents,total,shipping.address||null,shipping.city||null,shipping.state||null,shipping.postalCode||null,shipping.notes||null,shipping.recipientName||null,requested.notes,request.order_id);
-        recordPaymentAdjustment(request.order_id,'credit',Math.abs(delta),'Redução de total antes do pagamento',{type:'admin',id:req.admin?.sub,name:req.admin?.email},`order:${request.order_id}:change:${request.id}:credit`);
+        recordPaymentAdjustment(request.order_id,'credit',Math.abs(delta),'Redução de total sem excesso de pagamento após alteração',{type:'admin',id:req.admin?.sub,name:req.admin?.email},`order:${request.order_id}:change:${changeRequestId}:credit`);
+      }
+
+      if (nextPaymentStatus === 'pending') {
+        db.prepare("UPDATE orders SET payment_status='pending',payment_paid_at=NULL WHERE id=?").run(request.order_id);
+      } else {
+        db.prepare("UPDATE orders SET payment_status='paid' WHERE id=?").run(request.order_id);
       }
     } else {
+      reconcilePendingPayments();
       db.prepare('UPDATE orders SET subtotal_cents=?,shipping_cents=?,total_cents=?,shipping_address=COALESCE(?,shipping_address),shipping_city=COALESCE(?,shipping_city),shipping_state=COALESCE(?,shipping_state),shipping_postal_code=COALESCE(?,shipping_postal_code),shipping_notes=COALESCE(?,shipping_notes),shipping_recipient_name=COALESCE(?,shipping_recipient_name),notes=COALESCE(?,notes),updated_at=CURRENT_TIMESTAMP WHERE id=?')
         .run(subtotal,shippingCents,total,shipping.address||null,shipping.city||null,shipping.state||null,shipping.postalCode||null,shipping.notes||null,shipping.recipientName||null,requested.notes,request.order_id);
     }
-    db.prepare("UPDATE order_change_requests SET status='approved',recalculated_json=?,reviewed_by=?,reviewed_at=CURRENT_TIMESTAMP WHERE id=?").run(JSON.stringify({subtotalCents:subtotal,shippingCents,totalCents:total,deltaCents:delta}),req.admin?.sub||null,request.id);
+    db.prepare("UPDATE order_change_requests SET status='approved',recalculated_json=?,reviewed_by=?,reviewed_at=CURRENT_TIMESTAMP WHERE id=?").run(JSON.stringify({subtotalCents:subtotal,shippingCents,totalCents:total,deltaCents:delta}),req.admin?.sub||null,changeRequestId);
   })();
 
   const finalOrder=db.prepare('SELECT * FROM orders WHERE id=?').get(request.order_id);
-  recordOrderHistory(request.order_id,'change_approved',{totalCents:request.total_cents,paymentStatus:request.payment_status},{totalCents:total,deltaCents:delta,requestId:request.id,paymentStatus:finalOrder.payment_status},{type:'admin',id:req.admin?.sub,name:req.admin?.email});
-  queueNotification(request.customer_phone,'order_change_approved',{orderNumber:request.order_number,total:money(total),difference:money(Math.abs(delta)),differenceType:delta>0?'additional_payment':delta<0?'credit_or_refund':'none'},`order:${request.order_id}:change:${request.id}:approved`);
-  if(delta>0) queueNotification(request.customer_phone,'payment_due',{orderNumber:request.order_number,total:money(total),dueDate:finalOrder.payment_due_date,message:'Há diferença a pagar após a alteração.'},`order:${request.order_id}:change:${request.id}:payment`);
+  recordOrderHistory(request.order_id,'change_approved',{totalCents:request.total_cents,paymentStatus:request.payment_status},{totalCents:total,deltaCents:delta,requestId:changeRequestId,paymentStatus:finalOrder.payment_status},{type:'admin',id:req.admin?.sub,name:req.admin?.email});
+  queueNotification(request.customer_phone,'order_change_approved',{orderNumber:request.order_number,total:money(total),difference:money(Math.abs(delta)),differenceType:delta>0?'additional_payment':delta<0?'credit_or_refund':'none'},`order:${request.order_id}:change:${changeRequestId}:approved`);
+  if(delta>0) queueNotification(request.customer_phone,'payment_due',{orderNumber:request.order_number,total:money(total),dueDate:finalOrder.payment_due_date,message:'Há diferença a pagar após a alteração.'},`order:${request.order_id}:change:${changeRequestId}:payment`);
   return res.json({ok:true,status:'approved',order:orderView(finalOrder)});
 });
 app.get('/api/internal/order-status', requireWhatsAppInternal, (req, res) => {
@@ -1763,52 +1949,269 @@ app.patch('/api/admin/orders/:id', requireAdmin, (req, res) => {
   const id = Number(req.params.id);
   const current = db.prepare('SELECT * FROM orders WHERE id = ?').get(id);
   if (!current) return res.status(404).json({ error: 'Pedido não encontrado.' });
+
   const allowedStatus = ['pending', 'confirmed', 'preparing', 'shipped', 'delivered', 'cancelled'];
   const allowedPayment = ['pending', 'paid', 'refunded', 'failed'];
-  const nextStatus = allowedStatus.includes(req.body.status) ? req.body.status : current.status;
-  const nextPayment = allowedPayment.includes(req.body.paymentStatus) ? req.body.paymentStatus : current.payment_status;
-  const requestedDueDate = req.body.paymentDueDate === undefined ? current.payment_due_date : String(req.body.paymentDueDate || '').trim();
-  if (requestedDueDate && !/^\d{4}-\d{2}-\d{2}$/.test(requestedDueDate)) return res.status(400).json({ error: 'Data de vencimento inválida.' });
+
+  const nextStatus = allowedStatus.includes(req.body.status)
+    ? req.body.status
+    : current.status;
+
+  const requestedPayment = allowedPayment.includes(req.body.paymentStatus)
+    ? req.body.paymentStatus
+    : null;
+
+  const requestedDueDate = req.body.paymentDueDate === undefined
+    ? current.payment_due_date
+    : String(req.body.paymentDueDate || '').trim();
+
+  if (requestedDueDate && !/^\d{4}-\d{2}-\d{2}$/.test(requestedDueDate)) {
+    return res.status(400).json({ error: 'Data de vencimento inválida.' });
+  }
+
+  const currentSummary = orderPaymentSummary(id, current.total_cents);
+
   try {
-    if (nextStatus === 'cancelled' && ['shipped','delivered'].includes(current.status)) return res.status(409).json({ error: 'Pedidos em entrega ou já entregues não podem ser cancelados. Use um fluxo de devolução/estorno.' });
-    if (nextStatus === 'cancelled' && current.payment_status === 'paid' && nextPayment !== 'refunded') return res.status(409).json({ error: 'Pedido pago: registre o estorno antes de cancelar.' });
+    if (
+      nextStatus === 'cancelled' &&
+      ['shipped','delivered'].includes(current.status)
+    ) {
+      return res.status(409).json({
+        error: 'Pedidos em entrega ou já entregues não podem ser cancelados. Use um fluxo de devolução/estorno.'
+      });
+    }
+
+    if (
+      nextStatus === 'cancelled' &&
+      current.payment_status === 'paid' &&
+      requestedPayment !== 'refunded'
+    ) {
+      return res.status(409).json({
+        error: 'Pedido pago: registre o estorno antes de cancelar.'
+      });
+    }
+
     db.transaction(() => {
-      if (nextStatus !== 'cancelled' && ['confirmed', 'preparing', 'shipped', 'delivered'].includes(nextStatus) && !current.inventory_committed) commitInventory(id);
-      if (nextStatus === 'cancelled' && current.inventory_committed) {
-        const items=db.prepare('SELECT * FROM order_items WHERE order_id=?').all(id);
-        for(const item of items){db.prepare('UPDATE products SET stock_qty=stock_qty+?,updated_at=CURRENT_TIMESTAMP WHERE id=?').run(item.quantity,item.product_id);db.prepare("INSERT INTO stock_movements(product_id,type,quantity,unit_cost_cents,note) VALUES(?, 'in', ?, ?, ?)").run(item.product_id,item.quantity,item.unit_cost_cents,`Estorno do pedido ${current.order_number}`);}
-        db.prepare('UPDATE orders SET inventory_committed=0 WHERE id=?').run(id);
+      if (
+        nextStatus !== 'cancelled' &&
+        ['confirmed', 'preparing', 'shipped', 'delivered'].includes(nextStatus) &&
+        !current.inventory_committed
+      ) {
+        commitInventory(id);
       }
-      db.prepare('UPDATE orders SET status = ?, payment_status = ?, payment_due_date = ?, notes = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?').run(nextStatus, nextPayment, requestedDueDate || null, req.body.notes === undefined ? current.notes : String(req.body.notes), id);
+
+      if (nextStatus === 'cancelled' && current.inventory_committed) {
+        const items = db.prepare(
+          'SELECT * FROM order_items WHERE order_id=?'
+        ).all(id);
+
+        for (const item of items) {
+          db.prepare(
+            'UPDATE products SET stock_qty=stock_qty+?,updated_at=CURRENT_TIMESTAMP WHERE id=?'
+          ).run(item.quantity, item.product_id);
+
+          db.prepare(
+            "INSERT INTO stock_movements(product_id,type,quantity,unit_cost_cents,note) VALUES(?, 'in', ?, ?, ?)"
+          ).run(
+            item.product_id,
+            item.quantity,
+            item.unit_cost_cents,
+            `Estorno do pedido ${current.order_number}`
+          );
+        }
+
+        db.prepare(
+          'UPDATE orders SET inventory_committed=0 WHERE id=?'
+        ).run(id);
+      }
+
+      /*
+       * Pagamento:
+       * Nunca altera uma parcela já paga.
+       */
+      if (requestedPayment === 'paid' && currentSummary.remainingCents > 0) {
+        const reference = `order:${id}:patch-payment:${Date.now()}`;
+
+        db.prepare(`
+          INSERT INTO order_payments
+            (order_id, amount_cents, method, status, due_date, paid_at, reference, notes)
+          VALUES
+            (?, ?, ?, 'paid', ?, CURRENT_TIMESTAMP, ?, ?)
+        `).run(
+          id,
+          currentSummary.remainingCents,
+          String(req.body.method || current.payment_method || 'a_combinar'),
+          requestedDueDate || current.payment_due_date || null,
+          reference,
+          String(req.body.notes || '')
+        );
+      }
+
+      const paymentSummaryAfter = orderPaymentSummary(id, current.total_cents);
+
+      /*
+       * Mantemos orders.payment_status como pending enquanto existir saldo.
+       * A API apresenta "partial" através do resumo financeiro.
+       */
+      const dbPaymentStatus =
+        paymentSummaryAfter.status === 'refunded'
+          ? 'refunded'
+          : paymentSummaryAfter.remainingCents === 0 &&
+            paymentSummaryAfter.totalCents > 0
+            ? 'paid'
+            : 'pending';
+
+      db.prepare(`
+        UPDATE orders
+        SET status=?,
+            payment_status=?,
+            payment_due_date=?,
+            notes=?,
+            payment_paid_at=CASE
+              WHEN ?='paid' THEN COALESCE(payment_paid_at,CURRENT_TIMESTAMP)
+              ELSE payment_paid_at
+            END,
+            payment_reminder_sent_at=NULL,
+            updated_at=CURRENT_TIMESTAMP
+        WHERE id=?
+      `).run(
+        nextStatus,
+        dbPaymentStatus,
+        requestedDueDate || null,
+        req.body.notes === undefined
+          ? current.notes
+          : String(req.body.notes),
+        dbPaymentStatus,
+        id
+      );
     })();
   } catch (error) {
     return res.status(409).json({ error: error.message });
   }
+
   let row = db.prepare('SELECT * FROM orders WHERE id = ?').get(id);
-  const notesChanged = req.body.notes !== undefined && String(req.body.notes) !== String(current.notes || '');
-  const dueDateChanged = requestedDueDate !== current.payment_due_date;
-  const statusChanged = nextStatus !== current.status;
-  const paymentChanged = nextPayment !== current.payment_status;
+  const afterSummary = orderPaymentSummary(id, row.total_cents);
+
+  const notesChanged =
+    req.body.notes !== undefined &&
+    String(req.body.notes) !== String(current.notes || '');
+
+  const dueDateChanged =
+    requestedDueDate !== current.payment_due_date;
+
+  const statusChanged =
+    nextStatus !== current.status;
+
+  const paymentChanged =
+    afterSummary.status !== currentSummary.status;
+
   if (statusChanged || paymentChanged || dueDateChanged || notesChanged) {
-    recordOrderHistory(id, 'status_changed', { status: current.status, paymentStatus: current.payment_status, paymentDueDate: current.payment_due_date, notes: current.notes }, { status: nextStatus, paymentStatus: nextPayment, paymentDueDate: requestedDueDate || null, notes: req.body.notes === undefined ? current.notes : String(req.body.notes) }, { type: 'admin', id: req.admin?.sub, name: req.admin?.email }, String(req.body.reason || ''));
+    recordOrderHistory(
+      id,
+      'status_changed',
+      {
+        status: current.status,
+        paymentStatus: currentSummary.status,
+        paidCents: currentSummary.paidCents,
+        remainingCents: currentSummary.remainingCents,
+        paymentDueDate: current.payment_due_date,
+        notes: current.notes
+      },
+      {
+        status: nextStatus,
+        paymentStatus: afterSummary.status,
+        paidCents: afterSummary.paidCents,
+        remainingCents: afterSummary.remainingCents,
+        paymentDueDate: requestedDueDate || null,
+        notes: req.body.notes === undefined
+          ? current.notes
+          : String(req.body.notes)
+      },
+      {
+        type: 'admin',
+        id: req.admin?.sub,
+        name: req.admin?.email
+      },
+      String(req.body.reason || '')
+    );
   }
-  if (nextPayment !== current.payment_status || requestedDueDate !== current.payment_due_date) {
-    db.prepare(`UPDATE orders SET payment_paid_at = ${nextPayment === 'paid' ? 'COALESCE(payment_paid_at,CURRENT_TIMESTAMP)' : 'NULL'}, payment_reminder_sent_at = NULL WHERE id = ?`).run(id);
-    const activePayment = db.prepare("SELECT id FROM order_payments WHERE order_id = ? AND status != 'refunded' ORDER BY id DESC LIMIT 1").get(id);
-    if (activePayment) {
-      db.prepare('UPDATE order_payments SET status = ?, due_date = ?, paid_at = CASE WHEN ? = \'paid\' THEN COALESCE(paid_at,CURRENT_TIMESTAMP) ELSE paid_at END, updated_at = CURRENT_TIMESTAMP WHERE id = ?').run(nextPayment, requestedDueDate || null, nextPayment, activePayment.id);
-    } else {
-      db.prepare('INSERT INTO order_payments (order_id, amount_cents, method, status, due_date, paid_at) VALUES (?, ?, ?, ?, ?, CASE WHEN ? = \'paid\' THEN CURRENT_TIMESTAMP ELSE NULL END)').run(id, row.total_cents, row.payment_method, nextPayment, requestedDueDate || null, nextPayment);
-    }
-  }
+
   row = db.prepare('SELECT * FROM orders WHERE id = ?').get(id);
-  logAudit('admin', req.admin?.sub, req.admin?.email, 'order_status_changed', 'order', id, { status: nextStatus, paymentStatus: nextPayment });
-  const statusMessages = { confirmed: 'confirmado', preparing: 'em preparo', shipped: 'saiu para entrega', delivered: 'entregue', cancelled: 'cancelado' };
-  if (statusMessages[nextStatus]) queueNotification(row.customer_phone, 'order_status', { orderNumber: row.order_number, status: nextStatus, label: statusMessages[nextStatus] });
-  if (nextPayment === 'paid' && current.payment_status !== 'paid') queueNotification(row.customer_phone, 'payment_paid', { orderNumber: row.order_number, total: money(row.total_cents) }, `order:${id}:payment:paid`);
-  if (nextStatus === 'confirmed' && current.status !== 'confirmed') queueStaffNotification('pick', 'new_picking', { orderNumber: row.order_number, customerName: row.customer_name });
-  if (nextStatus === 'preparing') queueStaffNotification('pick', 'order_preparing', { orderNumber: row.order_number });
-  res.json({ order: orderView(row) });
+
+  logAudit(
+    'admin',
+    req.admin?.sub,
+    req.admin?.email,
+    'order_status_changed',
+    'order',
+    id,
+    {
+      status: nextStatus,
+      paymentStatus: afterSummary.status,
+      paidCents: afterSummary.paidCents,
+      remainingCents: afterSummary.remainingCents
+    }
+  );
+
+  const statusMessages = {
+    confirmed: 'confirmado',
+    preparing: 'em preparo',
+    shipped: 'saiu para entrega',
+    delivered: 'entregue',
+    cancelled: 'cancelado'
+  };
+
+  if (statusMessages[nextStatus]) {
+    queueNotification(
+      row.customer_phone,
+      'order_status',
+      {
+        orderNumber: row.order_number,
+        status: nextStatus,
+        label: statusMessages[nextStatus]
+      }
+    );
+  }
+
+  if (afterSummary.status === 'paid' && currentSummary.status !== 'paid') {
+    queueNotification(
+      row.customer_phone,
+      'payment_paid',
+      {
+        orderNumber: row.order_number,
+        total: money(row.total_cents)
+      },
+      `order:${id}:payment:paid`
+    );
+  }
+
+  if (
+    nextStatus === 'confirmed' &&
+    current.status !== 'confirmed'
+  ) {
+    queueStaffNotification(
+      'pick',
+      'new_picking',
+      {
+        orderNumber: row.order_number,
+        customerName: row.customer_name
+      }
+    );
+  }
+
+  if (nextStatus === 'preparing') {
+    queueStaffNotification(
+      'pick',
+      'order_preparing',
+      {
+        orderNumber: row.order_number
+      }
+    );
+  }
+
+  res.json({
+    order: orderView(row)
+  });
 });
 
 app.post('/api/admin/orders/:id/approve', requireAdmin, (req,res)=>{
@@ -1816,7 +2219,8 @@ app.post('/api/admin/orders/:id/approve', requireAdmin, (req,res)=>{
   const current=db.prepare('SELECT * FROM orders WHERE id=?').get(id);
   if(!current)return res.status(404).json({error:'Pedido não encontrado.'});
   if(current.status!=='pending')return res.status(409).json({error:'Somente pedidos pendentes podem ser aprovados.'});
-  if(current.payment_status!=='paid')return res.status(409).json({error:'O pedido precisa estar pago antes da aprovação.'});
+  const paymentSummary = orderPaymentSummary(id, current.total_cents);
+  if(paymentSummary.remainingCents > 0)return res.status(409).json({error:'O pedido precisa estar totalmente pago antes da aprovação.',remainingCents:paymentSummary.remainingCents,remaining:money(paymentSummary.remainingCents)});
   try{
     db.transaction(()=>{
       if(!current.inventory_committed)commitInventory(id);
@@ -1838,7 +2242,8 @@ app.post('/api/internal/staff/orders/:id/approve', requireWhatsAppInternal, (req
   const current=db.prepare(/^\\d+$/.test(rawId) ? 'SELECT * FROM orders WHERE id=?' : 'SELECT * FROM orders WHERE order_number=?').get(/^\\d+$/.test(rawId) ? Number(rawId) : rawId.toUpperCase());
   if(!current)return res.status(404).json({error:'Pedido não encontrado.'});
   const id=Number(current.id);
-  if(current.status!=='pending' || current.payment_status!=='paid')return res.status(409).json({error:'Pedido precisa estar pendente e pago para aprovação.'});
+  const paymentSummary = orderPaymentSummary(Number(current.id), current.total_cents);
+  if(current.status!=='pending' || paymentSummary.remainingCents > 0)return res.status(409).json({error:'Pedido precisa estar pendente e totalmente pago para aprovação.',remainingCents:paymentSummary.remainingCents,remaining:money(paymentSummary.remainingCents)});
   try{
     db.transaction(()=>{if(!current.inventory_committed)commitInventory(id);db.prepare("UPDATE orders SET status='confirmed',approved_by=?,approved_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP WHERE id=?").run(staff.id,id)})();
     const row=db.prepare('SELECT * FROM orders WHERE id=?').get(id);
@@ -1859,42 +2264,406 @@ app.post('/api/admin/orders/:id/payment', requireAdmin, (req, res) => {
   const id = Number(req.params.id);
   const order = db.prepare('SELECT * FROM orders WHERE id=?').get(id);
   if (!order) return res.status(404).json({ error: 'Pedido não encontrado.' });
-  const status = ['pending','paid','failed','refunded'].includes(req.body?.status) ? req.body.status : order.payment_status;
-  const dueDate = req.body?.dueDate === undefined ? order.payment_due_date : String(req.body.dueDate || '').trim();
-  if (dueDate && !/^\d{4}-\d{2}-\d{2}$/.test(dueDate)) return res.status(400).json({ error: 'Data de vencimento inválida.' });
+
+  const body = req.body || {};
+  const summaryBefore = orderPaymentSummary(id, order.total_cents);
+
+  const dueDate = body.dueDate === undefined
+    ? order.payment_due_date
+    : String(body.dueDate || '').trim();
+
+  if (dueDate && !/^\d{4}-\d{2}-\d{2}$/.test(dueDate)) {
+    return res.status(400).json({ error: 'Data de vencimento inválida.' });
+  }
+
   const todayPayment = new Date().toISOString().slice(0,10);
-  if (status === 'pending' && dueDate && dueDate !== todayPayment) return res.status(400).json({ error: 'Pedidos normais devem ter pagamento no mesmo dia. Campanhas possuem calendário próprio.' });
-  const before = { status: order.payment_status, dueDate: order.payment_due_date, paidAt: order.payment_paid_at };
-  db.transaction(() => {
-    db.prepare('UPDATE orders SET payment_status=?, payment_due_date=?, payment_paid_at=CASE WHEN ?=\'paid\' THEN COALESCE(payment_paid_at,CURRENT_TIMESTAMP) ELSE payment_paid_at END, payment_reminder_sent_at=NULL, updated_at=CURRENT_TIMESTAMP WHERE id=?').run(status, dueDate || null, status, id);
-    const activePayment = db.prepare("SELECT id FROM order_payments WHERE order_id = ? AND status != 'refunded' ORDER BY id DESC LIMIT 1").get(id);
-    if (activePayment) {
-      db.prepare('UPDATE order_payments SET status=?, due_date=?, paid_at=CASE WHEN ?=\'paid\' THEN COALESCE(paid_at,CURRENT_TIMESTAMP) ELSE paid_at END, updated_at=CURRENT_TIMESTAMP WHERE id=?').run(status, dueDate || null, status, activePayment.id);
-    } else {
-      db.prepare('INSERT INTO order_payments (order_id, amount_cents, method, status, due_date, paid_at) VALUES (?, ?, ?, ?, ?, CASE WHEN ?=\'paid\' THEN CURRENT_TIMESTAMP ELSE NULL END)').run(id, order.total_cents, order.payment_method, status, dueDate || null, status);
+
+  if (dueDate && dueDate !== todayPayment) {
+    return res.status(400).json({
+      error: 'Pedidos normais devem ter pagamento no mesmo dia. Campanhas possuem calendário próprio.'
+    });
+  }
+
+  /*
+   * Novo modelo financeiro:
+   * - paidCents = valor EXATO deste pagamento em centavos.
+   * - paidAmount = valor EXATO deste pagamento em reais.
+   * - status=paid sem valor = quitar todo o saldo restante.
+   * - pagamentos já pagos nunca são alterados.
+   */
+  let paymentCents = null;
+
+  if (body.paidCents !== undefined) {
+    const n = Number(body.paidCents);
+    if (!Number.isInteger(n) || n < 0) {
+      return res.status(400).json({ error: 'paidCents deve ser um número inteiro de centavos maior ou igual a zero.' });
     }
-  })();
-  recordOrderHistory(id, 'payment_updated', before, { status, dueDate }, { type:'admin', id:req.admin?.sub, name:req.admin?.email }, String(req.body?.notes || ''));
-  if (status === 'paid' && order.payment_status !== 'paid') queueNotification(order.customer_phone, 'payment_paid', { orderNumber: order.order_number, total: money(order.total_cents) }, `order:${id}:payment:paid`);
-  if (status !== 'paid') queueNotification(order.customer_phone, 'payment_due', { orderNumber: order.order_number, total: money(order.total_cents), dueDate: dueDate || null }, `order:${id}:payment:${status}:${dueDate || 'none'}`);
-  res.json({ order: orderView(db.prepare('SELECT * FROM orders WHERE id=?').get(id)) });
+    paymentCents = n;
+  } else if (body.paidAmount !== undefined) {
+    const n = Number(cents(body.paidAmount));
+    if (!Number.isFinite(n) || n < 0) {
+      return res.status(400).json({ error: 'paidAmount inválido.' });
+    }
+    paymentCents = n;
+  } else if (body.amountCents !== undefined) {
+    const n = Number(body.amountCents);
+    if (!Number.isInteger(n) || n < 0) {
+      return res.status(400).json({ error: 'amountCents deve ser um número inteiro de centavos maior ou igual a zero.' });
+    }
+    paymentCents = n;
+  }
+
+  const requestedStatus = ['pending','paid','failed','refunded'].includes(body.status)
+    ? body.status
+    : null;
+
+  /*
+   * Caso tradicional: status=paid sem informar valor.
+   * Quita exatamente o saldo restante.
+   */
+  if (paymentCents === null && requestedStatus === 'paid') {
+    paymentCents = summaryBefore.remainingCents;
+  }
+
+  if (paymentCents !== null) {
+    if (paymentCents > summaryBefore.remainingCents) {
+      return res.status(400).json({
+        error: 'O valor informado é maior que o saldo restante do pedido.',
+        remainingCents: summaryBefore.remainingCents,
+        remaining: money(summaryBefore.remainingCents)
+      });
+    }
+
+    if (paymentCents === 0 && summaryBefore.remainingCents > 0 && requestedStatus !== 'pending') {
+      return res.status(400).json({ error: 'Informe um valor de pagamento maior que zero.' });
+    }
+  }
+
+  const before = {
+    status: summaryBefore.status,
+    paidCents: summaryBefore.paidCents,
+    remainingCents: summaryBefore.remainingCents,
+    dueDate: order.payment_due_date,
+    paidAt: order.payment_paid_at
+  };
+
+  try {
+    db.transaction(() => {
+      /*
+       * Se foi informado um pagamento:
+       * adicionamos/quitamos SOMENTE uma parcela pendente.
+       */
+      if (paymentCents !== null && paymentCents > 0) {
+        const reference = body.reference
+          ? String(body.reference)
+          : `order:${id}:payment:${Date.now()}`;
+
+        /*
+         * Liquidação FIFO do saldo pendente.
+         *
+         * Regras:
+         * - pagamentos já pagos nunca são alterados;
+         * - consome primeiro as parcelas pending mais antigas;
+         * - pagamento parcial reduz a parcela pending;
+         * - parcela totalmente quitada passa para paid;
+         * - se o pagamento atravessar várias parcelas, continua
+         *   consumindo-as em ordem;
+         * - somente cria uma nova parcela paid se não houver
+         *   nenhuma pendência disponível.
+         */
+        let remainingPaymentCents = paymentCents;
+
+        const pendingRows = db.prepare(`
+          SELECT id, amount_cents, method, due_date, reference, notes
+          FROM order_payments
+          WHERE order_id=?
+            AND status='pending'
+            AND amount_cents > 0
+          ORDER BY id ASC
+        `).all(id);
+
+        for (const pending of pendingRows) {
+          if (remainingPaymentCents <= 0) break;
+
+          const pendingAmount = Math.max(0, Number(pending.amount_cents) || 0);
+          if (pendingAmount <= 0) continue;
+
+          const appliedCents = Math.min(remainingPaymentCents, pendingAmount);
+          const balanceCents = pendingAmount - appliedCents;
+
+          if (balanceCents === 0) {
+            db.prepare(`
+              UPDATE order_payments
+              SET status='paid',
+                  paid_at=COALESCE(paid_at,CURRENT_TIMESTAMP),
+                  due_date=?,
+                  method=COALESCE(NULLIF(?,''),method),
+                  reference=CASE WHEN reference='' THEN ? ELSE reference END,
+                  notes=CASE WHEN ? <> '' THEN ? ELSE notes END,
+                  updated_at=CURRENT_TIMESTAMP
+              WHERE id=? AND status='pending'
+            `).run(
+              dueDate || pending.due_date || null,
+              String(body.method || pending.method || ''),
+              reference,
+              String(body.notes || ''),
+              String(body.notes || ''),
+              pending.id
+            );
+          } else {
+            db.prepare(`
+              UPDATE order_payments
+              SET amount_cents=?,
+                  due_date=COALESCE(?,due_date),
+                  updated_at=CURRENT_TIMESTAMP
+              WHERE id=? AND status='pending'
+            `).run(
+              balanceCents,
+              dueDate || null,
+              pending.id
+            );
+
+            db.prepare(`
+              INSERT INTO order_payments
+                (order_id, amount_cents, method, status, due_date, paid_at, reference, notes)
+              VALUES
+                (?, ?, ?, 'paid', ?, CURRENT_TIMESTAMP, ?, ?)
+            `).run(
+              id,
+              appliedCents,
+              String(body.method || pending.method || order.payment_method || 'a_combinar'),
+              dueDate || pending.due_date || null,
+              reference,
+              String(body.notes || '')
+            );
+          }
+
+          remainingPaymentCents -= appliedCents;
+        }
+
+        /*
+         * Segurança adicional: se não havia parcelas pending,
+         * registra o pagamento como uma nova parcela paid.
+         *
+         * A validação acima já impede que o valor ultrapasse
+         * o saldo financeiro do pedido.
+         */
+        if (remainingPaymentCents > 0) {
+          db.prepare(`
+            INSERT INTO order_payments
+              (order_id, amount_cents, method, status, due_date, paid_at, reference, notes)
+            VALUES
+              (?, ?, ?, 'paid', ?, CURRENT_TIMESTAMP, ?, ?)
+          `).run(
+            id,
+            remainingPaymentCents,
+            String(body.method || order.payment_method || 'a_combinar'),
+            dueDate || null,
+            reference,
+            String(body.notes || '')
+          );
+        }
+      } else if (requestedStatus === 'failed') {
+        /*
+         * Falha não transforma pagamentos já pagos.
+         * Apenas registra uma nova tentativa de pagamento.
+         */
+        db.prepare(`
+          INSERT INTO order_payments
+            (order_id, amount_cents, method, status, due_date, failed_at, reference, notes)
+          VALUES
+            (?, ?, ?, 'failed', ?, CURRENT_TIMESTAMP, ?, ?)
+        `).run(
+          id,
+          Math.max(0, Number(summaryBefore.remainingCents)),
+          String(body.method || order.payment_method || 'a_combinar'),
+          dueDate || null,
+          String(body.reference || `order:${id}:payment:failed:${Date.now()}`),
+          String(body.notes || '')
+        );
+      } else if (requestedStatus === 'pending' && paymentCents === null) {
+        /*
+         * Apenas mantém o pedido como pendente.
+         * NÃO modifica pagamentos já registrados.
+         */
+      } else if (requestedStatus === 'refunded') {
+        return;
+      }
+
+      const afterPayments = orderPaymentSummary(id, order.total_cents);
+      const nextStatus =
+        afterPayments.status === 'refunded'
+          ? 'refunded'
+          : afterPayments.remainingCents === 0 &&
+            afterPayments.totalCents > 0
+            ? 'paid'
+            : 'pending';
+
+      const fullyPaid = nextStatus === 'paid';
+
+      db.prepare(`
+        UPDATE orders
+        SET payment_status=?,
+            payment_due_date=?,
+            payment_paid_at=CASE
+              WHEN ?='paid' THEN COALESCE(payment_paid_at,CURRENT_TIMESTAMP)
+              ELSE payment_paid_at
+            END,
+            payment_reminder_sent_at=NULL,
+            updated_at=CURRENT_TIMESTAMP
+        WHERE id=?
+      `).run(
+        nextStatus,
+        dueDate || order.payment_due_date || null,
+        nextStatus,
+        id
+      );
+    })();
+
+    const finalOrder = db.prepare('SELECT * FROM orders WHERE id=?').get(id);
+    const summaryAfter = orderPaymentSummary(id, finalOrder.total_cents);
+
+    recordOrderHistory(
+      id,
+      'payment_updated',
+      before,
+      {
+        status: summaryAfter.status,
+        paidCents: summaryAfter.paidCents,
+        remainingCents: summaryAfter.remainingCents,
+        dueDate: finalOrder.payment_due_date
+      },
+      { type:'admin', id:req.admin?.sub, name:req.admin?.email },
+      String(body.notes || '')
+    );
+
+    if (summaryAfter.status === 'paid' && summaryBefore.status !== 'paid') {
+      queueNotification(
+        finalOrder.customer_phone,
+        'payment_paid',
+        {
+          orderNumber: finalOrder.order_number,
+          total: money(finalOrder.total_cents)
+        },
+        `order:${id}:payment:paid`
+      );
+    } else if (summaryAfter.remainingCents > 0) {
+      queueNotification(
+        finalOrder.customer_phone,
+        'payment_due',
+        {
+          orderNumber: finalOrder.order_number,
+          total: money(finalOrder.total_cents),
+          paid: money(summaryAfter.paidCents),
+          remaining: money(summaryAfter.remainingCents),
+          dueDate: finalOrder.payment_due_date || null
+        },
+        `order:${id}:payment:due:${summaryAfter.remainingCents}`
+      );
+    }
+
+    res.json({
+      order: orderView(finalOrder)
+    });
+  } catch (e) {
+    res.status(409).json({ error: e.message });
+  }
 });
+
 app.post('/api/admin/orders/:id/refund', requireAdmin, (req,res)=>{
   const id=Number(req.params.id),order=db.prepare('SELECT * FROM orders WHERE id=?').get(id);
   if(!order)return res.status(404).json({error:'Pedido não encontrado.'});
   if(order.payment_status!=='paid' && order.payment_status!=='refunded')return res.status(409).json({error:'Somente pedidos pagos podem receber estorno.'});
-  const amount=Math.max(0,Math.min(Number(order.total_cents),req.body?.amount===undefined?Number(order.total_cents):cents(req.body.amount)));
-  if(!amount)return res.status(400).json({error:'Valor de estorno inválido.'});
+  const summaryBefore=orderPaymentSummary(id,order.total_cents);
+  const amount=req.body?.amount===undefined
+    ? summaryBefore.refundableCents
+    : cents(req.body.amount);
+  if(!Number.isInteger(amount) || amount<=0)return res.status(400).json({error:'Valor de estorno inválido.'});
   const key=String(req.body?.idempotencyKey||`order:${id}:refund:${amount}`);
+  let idempotent=false;
   try{
     db.transaction(()=>{
-      db.prepare("UPDATE orders SET payment_status='refunded',updated_at=CURRENT_TIMESTAMP WHERE id=?").run(id);
-      db.prepare("UPDATE order_payments SET status='refunded',refunded_at=COALESCE(refunded_at,CURRENT_TIMESTAMP),updated_at=CURRENT_TIMESTAMP WHERE order_id=? AND status='paid'").run(id);
+      const existing=db.prepare('SELECT order_id,type,amount_cents FROM order_payment_adjustments WHERE idempotency_key=?').get(key);
+      if(existing){
+        if(existing.order_id!==id || existing.type!=='refund' || existing.amount_cents!==amount){
+          throw new Error('A chave de idempotência já foi usada para outro estorno.');
+        }
+        idempotent=true;
+        return;
+      }
+
+      const currentSummary=orderPaymentSummary(id,order.total_cents);
+      if(amount>currentSummary.refundableCents){
+        throw new Error(`Valor de estorno maior que o saldo estornável de ${money(currentSummary.refundableCents)}.`);
+      }
+
+      /*
+       * O ledger não guarda um campo de estorno parcial na própria parcela.
+       * Portanto, dividimos somente as parcelas paid necessárias: a parte
+       * não estornada continua paid e a parte devolvida vira uma nova linha
+       * refunded. Assim, nenhum valor recebido desaparece nem é marcado como
+       * estornado além do solicitado.
+       */
+      let remainingToRefund=amount;
+      const paidRows=db.prepare(`
+        SELECT id,amount_cents,method,due_date,paid_at,reference,notes
+        FROM order_payments
+        WHERE order_id=? AND status='paid' AND amount_cents>0
+        ORDER BY id DESC
+      `).all(id);
+
+      for(const payment of paidRows){
+        if(remainingToRefund<=0)break;
+        const refundPart=Math.min(remainingToRefund,Number(payment.amount_cents));
+        if(refundPart===Number(payment.amount_cents)){
+          db.prepare(`
+            UPDATE order_payments
+            SET status='refunded',refunded_at=COALESCE(refunded_at,CURRENT_TIMESTAMP),updated_at=CURRENT_TIMESTAMP
+            WHERE id=? AND status='paid'
+          `).run(payment.id);
+        }else{
+          db.prepare(`
+            UPDATE order_payments
+            SET amount_cents=?,updated_at=CURRENT_TIMESTAMP
+            WHERE id=? AND status='paid'
+          `).run(Number(payment.amount_cents)-refundPart,payment.id);
+          db.prepare(`
+            INSERT INTO order_payments
+              (order_id,amount_cents,method,status,due_date,paid_at,refunded_at,reference,notes)
+            VALUES (?,?,?,'refunded',?,?,CURRENT_TIMESTAMP,?,?)
+          `).run(
+            id,refundPart,payment.method,payment.due_date,payment.paid_at,
+            `${key}:payment:${payment.id}`,
+            `${payment.notes || ''}${payment.notes ? ' | ' : ''}Estorno: ${String(req.body?.reason||'Estorno')}`
+          );
+        }
+        remainingToRefund-=refundPart;
+      }
+      if(remainingToRefund!==0)throw new Error('Não foi possível conciliar o estorno com os pagamentos pagos.');
+
+      const afterPayments=orderPaymentSummary(id,order.total_cents);
+      const nextPaymentStatus=afterPayments.status==='refunded'
+        ? 'refunded'
+        : afterPayments.remainingCents===0 && afterPayments.totalCents>0
+          ? 'paid'
+          : 'pending';
+      db.prepare("UPDATE orders SET payment_status=?,updated_at=CURRENT_TIMESTAMP WHERE id=?").run(nextPaymentStatus,id);
       recordPaymentAdjustment(id,'refund',amount,String(req.body?.reason||'Estorno'),{type:'admin',id:req.admin?.sub,name:req.admin?.email},key);
-      recordOrderHistory(id,'payment_refunded',{paymentStatus:order.payment_status},{paymentStatus:'refunded',amountCents:amount},{type:'admin',id:req.admin?.sub,name:req.admin?.email});
+      recordOrderHistory(id,'payment_refunded',{
+        paymentStatus:summaryBefore.status,
+        paidCents:summaryBefore.paidCents,
+        refundedCents:summaryBefore.refundedCents,
+        remainingCents:summaryBefore.remainingCents
+      },{
+        paymentStatus:afterPayments.status,
+        paidCents:afterPayments.paidCents,
+        refundedCents:afterPayments.refundedCents,
+        remainingCents:afterPayments.remainingCents,
+        amountCents:amount
+      },{type:'admin',id:req.admin?.sub,name:req.admin?.email});
     })();
-    queueNotification(order.customer_phone,'payment_refunded',{orderNumber:order.order_number,amount:money(amount)},`order:${id}:payment:refunded:${amount}`);
-    res.json({ok:true,order:orderView(db.prepare('SELECT * FROM orders WHERE id=?').get(id))});
+    if(!idempotent)queueNotification(order.customer_phone,'payment_refunded',{orderNumber:order.order_number,amount:money(amount)},`order:${id}:payment:refunded:${amount}`);
+    res.json({ok:true,idempotent,order:orderView(db.prepare('SELECT * FROM orders WHERE id=?').get(id))});
   }catch(e){res.status(409).json({error:e.message});}
 });
 app.post('/api/admin/orders/:id/delivery-attempt', requireAdmin, (req,res)=>{

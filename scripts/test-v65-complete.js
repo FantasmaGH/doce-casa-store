@@ -38,5 +38,7 @@ assert.match(whatsapp, /payment_reminder/, 'WhatsApp lacks payment reminder form
 assert.match(whatsapp, /order_confirmed/, 'WhatsApp lacks order confirmation formatting');
 assert.match(whatsapp, /payment_refunded/, 'WhatsApp lacks refund formatting');
 assert.match(whatsapp, /aprovar pedido/, 'WhatsApp lacks staff order approval command');
+assert.match(server, /const shippingInput = requested\.shipping\?\.shippingCents \?\? 0;/, 'change request shipping input handling');
+assert.match(server, /typeof shippingInput === 'number' && Number\.isInteger\(shippingInput\)/, 'change request shipping cents integer handling');
 
-console.log(`PASS V6.5.2 complete static suite: ${required.length + 5} checks`);
+console.log(`PASS V6.5.2 complete static suite: ${required.length + 7} checks`);
