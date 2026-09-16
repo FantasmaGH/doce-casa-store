@@ -2575,9 +2575,11 @@ app.post('/api/admin/orders/:id/refund', requireAdmin, (req,res)=>{
   if(!order)return res.status(404).json({error:'Pedido não encontrado.'});
   if(order.payment_status!=='paid' && order.payment_status!=='refunded')return res.status(409).json({error:'Somente pedidos pagos podem receber estorno.'});
   const summaryBefore=orderPaymentSummary(id,order.total_cents);
-  const amount=req.body?.amount===undefined
-    ? summaryBefore.refundableCents
-    : cents(req.body.amount);
+  const amount = req.body?.amountCents !== undefined
+    ? Number(req.body.amountCents)
+    : req.body?.amount === undefined
+      ? summaryBefore.refundableCents
+      : cents(req.body.amount);
   if(!Number.isInteger(amount) || amount<=0)return res.status(400).json({error:'Valor de estorno inválido.'});
   const key=String(req.body?.idempotencyKey||`order:${id}:refund:${amount}`);
   let idempotent=false;
